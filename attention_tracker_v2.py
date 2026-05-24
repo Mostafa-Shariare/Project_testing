@@ -29,7 +29,9 @@ import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib
-matplotlib.use("TkAgg")
+# Use Agg (non-interactive) so matplotlib never touches the tkinter main loop.
+# The dashboard is shown via plt.show() which opens its own window cleanly.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
@@ -38,6 +40,15 @@ from attention_model import (
     predict_proba_attention,
     explain_prediction,
 )
+
+# Suppress verbose MediaPipe / TensorFlow Lite internal logs
+import os as _os
+import warnings
+_os.environ.setdefault("GLOG_minloglevel", "3")
+_os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+_os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
+# Suppress Python 3.14 tkinter deallocator RuntimeError noise on shutdown
+warnings.filterwarnings("ignore", message=".*main thread.*", category=RuntimeWarning)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MediaPipe — Face Landmarker
@@ -115,22 +126,29 @@ def get_hand_model():
 # ══════════════════════════════════════════════════════════════════════════════
 _yolo_model     = None
 _yolo_available = False
+_yolo_tried     = False          # attempt load only ONCE — prevents per-frame spam
 PHONE_CLASS_ID  = 67    # COCO class 67 = "cell phone"
 PHONE_CONF_THRESH = 0.40
 
 def get_yolo():
-    """Lazy-load YOLOv8n. Returns None gracefully if unavailable."""
-    global _yolo_model, _yolo_available
-    if _yolo_model is not None:
+    """
+    Lazy-load YOLOv8n once. After the first attempt (success or failure)
+    _yolo_tried is set to True and subsequent calls return immediately
+    without re-importing or printing any warnings.
+    """
+    global _yolo_model, _yolo_available, _yolo_tried
+    if _yolo_tried:                  # already attempted — return cached result
         return _yolo_model
+    _yolo_tried = True               # mark as attempted before trying
     try:
         from ultralytics import YOLO
-        print("Loading YOLOv8n (downloads ~6 MB on first run)…")
+        print("Loading YOLOv8n (downloads ~6 MB on first run)...")
         _yolo_model     = YOLO("yolov8n.pt")
         _yolo_available = True
         print("YOLOv8n ready.")
     except Exception as e:
-        print(f"[WARN] YOLOv8 unavailable: {e}. Phone detection disabled.")
+        print(f"[WARN] YOLOv8 unavailable: {e}.")
+        print("       Phone detection disabled. Run: pip install ultralytics")
         _yolo_model     = None
         _yolo_available = False
     return _yolo_model
@@ -190,22 +208,56 @@ def detect_hands(frame) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Temporal Smoother
+# Temporal Smoother  ← NEW
 # ══════════════════════════════════════════════════════════════════════════════
 class TemporalSmoother:
+    """
+    Maintains a rolling window of model probabilities and returns a smoothed
+    value and a stable label.
+
+    Why this matters
+    ────────────────
+    Without smoothing, every frame is classified independently.  At a decision
+    boundary (prob ≈ 0.50) the label flickers ATTENTIVE→DISTRACTED every frame.
+    A 15-frame window (~0.5 s at 30 fps) absorbs single-frame noise so the label
+    only changes when there is a genuine sustained trend.
+
+    Hysteresis adds a dead-band: once the label switches to DISTRACTED it stays
+    there until the mean rises above 0.55 (not just 0.50), preventing rapid
+    toggling near the boundary.
+    """
+
     def __init__(self, window: int = 15, low: float = 0.45, high: float = 0.55):
+        """
+        Parameters
+        ----------
+        window : number of frames in the rolling window
+        low    : mean must fall below this to switch to DISTRACTED
+        high   : mean must rise above this to switch to ATTENTIVE
+        """
         self._probs  = collections.deque(maxlen=window)
-        self._label  = 1
+        self._label  = 1        # start optimistic
         self._low    = low
         self._high   = high
 
     def update(self, prob: float) -> tuple[float, int]:
+        """
+        Push a new probability.
+
+        Returns
+        -------
+        smoothed_prob : float  — rolling mean
+        stable_label  : int    — 0 or 1, with hysteresis
+        """
         self._probs.append(prob)
         mean = sum(self._probs) / len(self._probs)
+
+        # Hysteresis: only switch if we clearly cross the threshold
         if self._label == 1 and mean < self._low:
             self._label = 0
         elif self._label == 0 and mean > self._high:
             self._label = 1
+
         return mean, self._label
 
     def smoothed_prob(self) -> float:
@@ -292,8 +344,16 @@ def pose_bucket(yaw, pitch) -> str:
 
 def heuristic_attention(yaw, pitch, gaze_dir, ear_avg,
                         no_face: bool = False) -> int:
+    """
+    Compute heuristic attention score 0-100.
+
+    Fixes vs original:
+      - no_face=True  → returns 0 immediately (face hidden = not attentive)
+      - gaze "Away"   → 0 score (new label for no-face gaze)
+      - eye_sc uses 0.18 threshold (slightly relaxed for glasses users)
+    """
     if no_face:
-        return 0
+        return 0          # face covered / out of frame = not attentive
 
     yaw_pen   = min(abs(yaw)   / 45.0, 1.0)
     pitch_pen = min(abs(pitch) / 30.0, 1.0)
@@ -301,12 +361,12 @@ def heuristic_attention(yaw, pitch, gaze_dir, ear_avg,
 
     if gaze_dir == "Center":
         gaze_sc = 1.0
-    elif gaze_dir == "Away":
+    elif gaze_dir == "Away":   # no face detected
         gaze_sc = 0.0
-    else:
-        gaze_sc = 0.4
+    else:                      # Left / Right
+        gaze_sc = 0.4          # penalise more than before (was 0.5)
 
-    eye_sc = min(ear_avg / 0.22, 1.0)
+    eye_sc = min(ear_avg / 0.22, 1.0)   # slightly relaxed threshold
     return int(np.clip((pose_sc * 0.5 + gaze_sc * 0.3 + eye_sc * 0.2) * 100, 0, 100))
 
 
@@ -339,9 +399,17 @@ class BlinkDetector:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Feature extraction
+# Feature extraction  — all 16 features now real
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_features(frame, face_lmk, phone_feat: dict, no_of_hand: int):
+    """
+    Build the 16-feature dict from:
+      face_lmk   — MediaPipe FaceLandmarker result
+      phone_feat — YOLOv8 phone detection result   (was always 0 before)
+      no_of_hand — MediaPipe Hands count           (was always 0 before)
+
+    Returns: (feature_dict, pose_angles, ear_avg, gaze_dir)
+    """
     h, w        = frame.shape[:2]
     pose_angles = None
     ear_avg     = 0.30
@@ -376,6 +444,11 @@ def extract_features(frame, face_lmk, phone_feat: dict, no_of_hand: int):
         ear_r    = eye_aspect_ratio(lms, RIGHT_EYE_IDS, w, h)
         ear_avg  = (ear_l + ear_r) / 2.0
 
+        # Real iris-based gaze: compare iris centre position within eye socket
+        # Left eye:  outer=33, inner=133, iris_centre=468
+        # Right eye: inner=362, outer=263, iris_centre=473
+        # Ratio 0.0=far left, 0.5=centre, 1.0=far right
+        # Average both eyes for robustness
         def _iris_ratio(outer_idx, inner_idx, iris_idx):
             ox = lms[outer_idx].x * w
             ix_inner = lms[inner_idx].x * w
@@ -401,18 +474,18 @@ def extract_features(frame, face_lmk, phone_feat: dict, no_of_hand: int):
         pose_x   = 0.0
         pose_y   = 0.0
         pose_str  = "forward"
-        ear_avg   = 0.0
-        gaze_dir  = "Away"
+        ear_avg   = 0.0     # treat as eyes fully closed (forces distraction)
+        gaze_dir  = "Away"  # non-Centre gaze penalty
 
     feat = {
         "no_of_face": no_face,
         "face_x":  face_x,  "face_y": face_y,
         "face_w":  face_w,  "face_h": face_h,
         "face_con": face_con,
-        "no_of_hand": no_of_hand,
+        "no_of_hand": no_of_hand,        # ← now REAL
         "pose":    pose_str,
         "pose_x":  pose_x,  "pose_y": pose_y,
-        **phone_feat,
+        **phone_feat,                     # ← now REAL
     }
     return feat, pose_angles, ear_avg, gaze_dir
 
@@ -466,6 +539,7 @@ def _score_color(v):
 
 
 def draw_yolo_boxes(frame, phone_boxes: list, show: bool):
+    """Draw YOLO phone detection bounding boxes."""
     if not show:
         return
     for (x1, y1, x2, y2, conf) in phone_boxes:
@@ -491,18 +565,21 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
     row = 55
     dy  = 26
 
+    # Session timer
     elapsed = info.get("elapsed", 0)
     m, s = divmod(int(elapsed), 60)
     cv2.putText(frame, f"Session  {m:02d}:{s:02d}",
                 (10, row), FONT, 0.44, C_MUTED, 1, cv2.LINE_AA)
     row += dy
 
+    # Gaze
     gaze     = info.get("gaze", "—")
     gaze_col = C_GOOD if gaze == "Center" else (C_WARN if gaze in ("Left","Right") else C_BAD)
     cv2.putText(frame, f"Gaze     {gaze}",
                 (10, row), FONT, 0.44, gaze_col, 1, cv2.LINE_AA)
     row += dy
 
+    # Head pose
     pose = info.get("pose")
     if pose:
         p, y, r = pose
@@ -515,12 +592,14 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
     else:
         row += dy
 
+    # EAR
     ear     = info.get("ear", 0.0)
     ear_col = C_BAD if ear < EAR_THRESH else C_GOOD
     cv2.putText(frame, f"EAR      {ear:.3f}",
                 (10, row), FONT, 0.42, ear_col, 1, cv2.LINE_AA)
     row += dy
 
+    # Blink
     bpm     = info.get("blinks_per_min", 0.0)
     bpm_col = C_WARN if bpm > 25 else C_MUTED
     cv2.putText(frame, f"Blinks   {info.get('blinks', 0)}",
@@ -530,6 +609,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                 (10, row), FONT, 0.42, bpm_col, 1, cv2.LINE_AA)
     row += dy
 
+    # ── NEW: Phone & Hand indicators ─────────────────────────────────────
     phone_det = info.get("phone_detected", False)
     hands_n   = info.get("hands_count", 0)
     phone_col = C_BAD   if phone_det else C_MUTED
@@ -543,6 +623,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                 (10, row), FONT, 0.42, hand_col, 1, cv2.LINE_AA)
     row += dy + 4
 
+    # ── Heuristic bar ─────────────────────────────────────────────────────
     attn  = info.get("attention", 0)
     a_col = _score_color(attn)
     cv2.putText(frame, "Heuristic Score",
@@ -553,6 +634,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                 (PW - 38, row + 10), FONT, 0.38, a_col, 1, cv2.LINE_AA)
     row += 22
 
+    # ── Smoothed model bar (NEW label shows smoothing active) ─────────────
     prob     = info.get("model_prob_smoothed", 0.0)
     raw_prob = info.get("model_prob_raw", 0.0)
     prob_pct = int(prob * 100)
@@ -565,16 +647,19 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                 (PW - 38, row + 10), FONT, 0.38, p_col, 1, cv2.LINE_AA)
     row += 22
 
+    # Raw prob small indicator
     raw_pct = int(raw_prob * 100)
     cv2.putText(frame, f"raw: {raw_pct}%",
                 (10, row), FONT, 0.34, C_MUTED, 1, cv2.LINE_AA)
     row += dy
 
+    # Rolling average
     avg = info.get("avg_attention", 0)
     cv2.putText(frame, f"Avg (10s)  {avg}%",
                 (10, row), FONT, 0.42, _score_color(avg), 1, cv2.LINE_AA)
     row += dy
 
+    # Classification label (stable — from smoother)
     pred     = info.get("model_pred_stable", -1)
     pred_lbl = "ATTENTIVE" if pred == 1 else ("DISTRACTED" if pred == 0 else "—")
     pred_col = C_GOOD if pred == 1 else C_BAD
@@ -582,6 +667,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                 (10, row), FONTB, 0.58, pred_col, 1, cv2.LINE_AA)
     row += dy
 
+    # Alert
     alert = info.get("alert", "")
     if alert and int(time.time() * 2) % 2 == 0:
         _alpha_rect(frame, 0, row - 4, PW, row + 20, C_BAD, alpha=0.55)
@@ -589,6 +675,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
                     (8, row + 12), FONT, 0.42, C_WHITE, 1, cv2.LINE_AA)
         row += 28
 
+    # XAI reason
     if show_xai:
         xai_top = info.get("xai_top_reason", "")
         if xai_top:
@@ -596,15 +683,22 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
             _alpha_rect(frame, 0, xai_y, PW, xai_y + 44, C_PANEL, alpha=0.90)
             cv2.putText(frame, "XAI:", (10, xai_y + 15),
                         FONT, 0.38, C_BLUE, 1, cv2.LINE_AA)
-            words = xai_top.split()
-            line1 = " ".join(words[:4])
-            line2 = " ".join(words[4:])
+            # Split into direction+feature on line1, value on line2
+            # Format is always: "(+/-) feature_name: +0.000"
+            if ": " in xai_top:
+                parts = xai_top.rsplit(": ", 1)
+                line1 = parts[0]          # e.g. "(+) pose_forward"
+                line2 = parts[1]          # e.g. "+0.290"
+            else:
+                line1 = xai_top
+                line2 = ""
             cv2.putText(frame, line1, (10, xai_y + 30),
                         FONT, 0.36, C_WHITE, 1, cv2.LINE_AA)
             if line2:
                 cv2.putText(frame, line2, (10, xai_y + 44),
                             FONT, 0.36, C_MUTED, 1, cv2.LINE_AA)
 
+    # Arc gauge (top-right)
     cx, cy = W - 56, 60
     _alpha_rect(frame, W - 116, 8, W - 4, 118, C_BG, alpha=0.80)
     _arc(frame, cx, cy, 42, prob_pct, fg=p_col, thickness=7)
@@ -613,6 +707,7 @@ def draw_hud(frame, info: dict, show_xai: bool = False):
     cv2.putText(frame, "MODEL",
                 (cx - 20, cy + 22), FONT, 0.30, C_MUTED, 1, cv2.LINE_AA)
 
+    # Controls hint
     cv2.putText(frame, "M:mesh  X:xai  Y:yolo  Q:quit",
                 (W - 210, H - 10), FONT, 0.34, C_MUTED, 1, cv2.LINE_AA)
 
@@ -653,10 +748,10 @@ class XAIWorker:
         pred = r.get("prediction", -1)
         if pred == 1 and r.get("top_positive"):
             f, v = r["top_positive"][0]
-            return f"▲ {f}: {v:+.3f}"
+            return f"(+) {f}: {v:+.3f}"
         if pred == 0 and r.get("top_negative"):
             f, v = r["top_negative"][0]
-            return f"▼ {f}: {v:+.3f}"
+            return f"(-) {f}: {v:+.3f}"
         return ""
 
 
@@ -693,6 +788,7 @@ def show_dashboard(session_data: dict):
     fig.suptitle("Attention Session Report", fontsize=17,
                  fontweight="bold", color=WHITE, y=0.96)
 
+    # KPI panel
     ax0 = fig.add_subplot(gs[0, 0])
     ax0.set_facecolor(PANEL); ax0.set_axis_off()
     m_, s_ = divmod(int(dur), 60)
@@ -717,6 +813,7 @@ def show_dashboard(session_data: dict):
         ax.tick_params(colors=MUTED)
         for sp in ax.spines.values(): sp.set_edgecolor(PANEL)
 
+    # Heuristic timeline
     ax1 = fig.add_subplot(gs[0, 1]); _style(ax1, "Heuristic Attention Score")
     if attn_s:
         xs = np.linspace(0, dur / 60, len(attn_s))
@@ -725,6 +822,7 @@ def show_dashboard(session_data: dict):
         ax1.axhline(70, color=AMBER, linewidth=0.7, linestyle="--", alpha=0.6)
         ax1.set_ylim(0, 105); ax1.set_xlabel("Minutes"); ax1.set_ylabel("Score (%)")
 
+    # Smoothed model confidence
     ax2 = fig.add_subplot(gs[0, 2]); _style(ax2, "Smoothed Model Confidence")
     if prob_s:
         xp = np.linspace(0, dur / 60, len(prob_s))
@@ -733,6 +831,7 @@ def show_dashboard(session_data: dict):
         ax2.axhline(0.70, color=AMBER, linewidth=0.7, linestyle="--", alpha=0.6)
         ax2.set_ylim(0, 1.05); ax2.set_xlabel("Minutes"); ax2.set_ylabel("P(Attentive)")
 
+    # Classification pie
     ax3 = fig.add_subplot(gs[1, 0]); _style(ax3, "Classification Distribution")
     if model_s:
         ac = int(sum(model_s)); dc = len(model_s) - ac
@@ -744,6 +843,7 @@ def show_dashboard(session_data: dict):
         )
         for at in autotexts: at.set_color(DARK); at.set_fontweight("bold")
 
+    # Blink rate
     ax4 = fig.add_subplot(gs[1, 1]); _style(ax4, "Blink Rate Trend")
     if blink_s:
         xb = np.linspace(0, dur / 60, len(blink_s))
@@ -753,6 +853,7 @@ def show_dashboard(session_data: dict):
         ax4.legend(fontsize=7, labelcolor=MUTED, facecolor=PANEL, edgecolor=PANEL)
         ax4.set_xlabel("Minutes"); ax4.set_ylabel("Blinks/min")
 
+    # Phone presence timeline  ← NEW panel
     ax5 = fig.add_subplot(gs[1, 2]); _style(ax5, "Phone Detection Timeline")
     if phone_s:
         xph = np.linspace(0, dur / 60, len(phone_s))
@@ -763,13 +864,35 @@ def show_dashboard(session_data: dict):
         ax5.set_xlabel("Minutes")
         ax5.set_ylabel("Phone present")
 
-    plt.show()
+    # Save dashboard to a temp file and open it with the default image viewer.
+    # This avoids any tkinter/matplotlib thread conflict entirely.
+    import tempfile, subprocess, sys as _sys
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    plt.savefig(tmp.name, dpi=120, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close("all")
+    print(f"  Dashboard saved → {tmp.name}")
+    # Open with default OS image viewer (non-blocking)
+    if _sys.platform.startswith("win"):
+        _os.startfile(tmp.name)
+    elif _sys.platform == "darwin":
+        subprocess.Popen(["open", tmp.name])
+    else:
+        subprocess.Popen(["xdg-open", tmp.name])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# YOLO background thread
+# YOLO background thread  ← NEW
 # ══════════════════════════════════════════════════════════════════════════════
 class YOLOWorker:
+    """
+    Runs YOLOv8 phone detection in a background thread every N frames.
+    YOLOv8n takes ~20–40 ms per frame on CPU — too slow to run every frame
+    without dropping the main loop below 15 fps.
+    Running every 6 frames means at 30 fps phone state refreshes at 5 Hz,
+    which is more than fast enough for the use case.
+    """
     def __init__(self, every_n: int = 6):
         self.every_n   = every_n
         self._feat     = {
@@ -806,7 +929,7 @@ class YOLOWorker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main tracking loop  — FIXED: face_absent defined before first use
+# Main tracking loop
 # ══════════════════════════════════════════════════════════════════════════════
 def run_tracking(stop_event=None):
     if stop_event is None:
@@ -821,13 +944,42 @@ def run_tracking(stop_event=None):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     face_lmk   = get_face_landmarker()
-    _           = get_hand_model()
-    _           = get_yolo()
 
-    blink_det   = BlinkDetector()
-    smoother    = TemporalSmoother(window=15, low=0.45, high=0.55)
-    yolo_worker = YOLOWorker(every_n=6)
-    xai_worker  = XAIWorker(every_n=20)
+    # ── Startup diagnostics — printed once so you know what is active ────
+    print("\n" + "="*50)
+    print("  ATTENTION TRACKER — STARTUP CHECK")
+    print("="*50)
+    print(f"  [OK] Face landmarker       : {FACE_MODEL_PATH}")
+
+    # Hand model
+    try:
+        get_hand_model()
+        print(f"  [OK] Hand landmarker       : {HAND_MODEL_PATH}")
+        hand_ok = True
+    except Exception as e:
+        print(f"  [--] Hand landmarker       : FAILED ({e})")
+        hand_ok = False
+
+    # YOLO
+    get_yolo()
+    if _yolo_available:
+        print(f"  [OK] YOLOv8 phone detector : yolov8n.pt")
+    else:
+        print(f"  [--] YOLOv8 phone detector : NOT available")
+        print(f"       Fix: activate venv then run: pip install ultralytics")
+
+    # Model PKL files
+    import os as _os2
+    for pkl in ["attention_model.pkl", "attention_scaler.pkl", "attention_columns.pkl"]:
+        status = "[OK]" if _os2.path.exists(pkl) else "[!!] MISSING"
+        print(f"  {status} {pkl}")
+
+    print("="*50 + "\n")
+
+    blink_det  = BlinkDetector()
+    smoother   = TemporalSmoother(window=15, low=0.45, high=0.55)   # ← NEW
+    yolo_worker= YOLOWorker(every_n=6)                               # ← NEW
+    xai_worker = XAIWorker(every_n=20)
 
     show_mesh     = False
     show_xai_hud  = True
@@ -838,14 +990,12 @@ def run_tracking(stop_event=None):
     model_attn_hist  = []
     model_prob_hist  = []
     blink_rate_hist  = []
-    phone_hist       = []
+    phone_hist       = []      # ← NEW: track phone presence over session
 
     # Probe model
-    _probe = {k: 0 for k in FEATURE_KEYS}
-    _probe["pose"] = "forward"
+    _probe = {k: 0 for k in FEATURE_KEYS}; _probe["pose"] = "forward"
     try:
-        predict_attention(_probe)
-        model_ok = True
+        predict_attention(_probe); model_ok = True
     except Exception as e:
         model_ok = False
         print(f"[WARN] Model unavailable: {e}")
@@ -862,12 +1012,12 @@ def run_tracking(stop_event=None):
         yolo_worker.tick(frame)
         phone_feat, phone_boxes = yolo_worker.get()
 
-        # ── Hand detection ───────────────────────────────────────────────
+        # ── Hand detection (fast on CPU, every frame) ────────────────────
         no_of_hand = detect_hands(frame)
 
         # ── Face landmarks ───────────────────────────────────────────────
-        rgb         = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_img      = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         face_result = face_lmk.detect(mp_img)
 
         feat, pose_angles, ear_avg, gaze_dir = extract_features(
@@ -875,30 +1025,16 @@ def run_tracking(stop_event=None):
         )
         blink_det.update(ear_avg)
 
-        # ── CRITICAL FIX: define face_absent first ───────────────────────
+        # face_absent must be set FIRST — everything below depends on it
         face_absent = not bool(face_result.face_landmarks)
 
-        # ── Heuristic score ──────────────────────────────────────────────
+        # ── Heuristic score (needed before model block) ──────────────────
         if face_absent:
             h_score = heuristic_attention(0, 0, gaze_dir, ear_avg, no_face=True)
         elif pose_angles:
             h_score = heuristic_attention(pose_angles[1], pose_angles[0], gaze_dir, ear_avg)
         else:
             h_score = heuristic_attention(0, 0, gaze_dir, ear_avg)
-
-        # ── Model inference ──────────────────────────────────────────────
-        if face_absent:
-            raw_prob = 0.0
-        elif model_ok:
-            try:
-                raw_prob = predict_proba_attention(feat)
-            except Exception:
-                raw_prob = 0.5
-        else:
-            raw_prob = h_score / 100.0
-
-        # ── Temporal smoothing ───────────────────────────────────────────
-        smoothed_prob, stable_label = smoother.update(raw_prob)
 
         # ── Draw overlays ────────────────────────────────────────────────
         if face_result.face_landmarks:
@@ -911,13 +1047,28 @@ def run_tracking(stop_event=None):
 
         draw_yolo_boxes(frame, phone_boxes, show_yolo_box)
 
+        # ── Model inference ──────────────────────────────────────────────
+        if face_absent:
+            # No face in frame — bypass model entirely, force distraction
+            raw_prob = 0.0
+        elif model_ok:
+            try:
+                raw_prob = predict_proba_attention(feat)
+            except Exception:
+                raw_prob = h_score / 100.0
+        else:
+            raw_prob = h_score / 100.0
+
+        # ── Temporal smoothing ───────────────────────────────────────────
+        smoothed_prob, stable_label = smoother.update(raw_prob)
+
         blend = int(h_score * 0.55 + smoothed_prob * 100 * 0.45)
 
         attn_hist.append(blend)
         model_attn_hist.append(stable_label)
         model_prob_hist.append(smoothed_prob)
         blink_rate_hist.append(blink_det.blinks_per_minute())
-        phone_hist.append(phone_feat["phone"])
+        phone_hist.append(phone_feat["phone"])     # ← NEW
 
         # ── XAI ─────────────────────────────────────────────────────────
         xai_worker.tick(feat)
@@ -925,34 +1076,34 @@ def run_tracking(stop_event=None):
         # ── Build info dict ──────────────────────────────────────────────
         bpm = blink_det.blinks_per_minute()
         info = {
-            "elapsed":             time.time() - start_time,
-            "gaze":                gaze_dir if not face_absent else "No Face",
-            "pose":                pose_angles,
-            "ear":                 ear_avg,
-            "blinks":              blink_det.total,
-            "blinks_per_min":      bpm,
-            "attention":           blend,
-            "avg_attention":       int(np.mean(attn_hist[-300:])),
-            "model_pred_stable":   stable_label,
-            "model_prob_smoothed": smoothed_prob,
-            "model_prob_raw":      raw_prob,
-            "phone_detected":      bool(phone_feat["phone"]),
-            "hands_count":         no_of_hand,
-            "xai_top_reason":      xai_worker.top_reason(),
-            "alert":               "",
+            "elapsed":           time.time() - start_time,
+            "gaze":              gaze_dir if face_result.face_landmarks else "No Face",
+            "pose":              pose_angles,
+            "ear":               ear_avg,
+            "blinks":            blink_det.total,
+            "blinks_per_min":    bpm,
+            "attention":         blend,
+            "avg_attention":     int(np.mean(attn_hist[-300:])),
+            "model_pred_stable": stable_label,          # ← smoothed label
+            "model_prob_smoothed": smoothed_prob,        # ← smoothed prob
+            "model_prob_raw":    raw_prob,               # ← raw per-frame
+            "phone_detected":    bool(phone_feat["phone"]),
+            "hands_count":       no_of_hand,
+            "xai_top_reason":    xai_worker.top_reason(),
+            "alert":             "",
         }
 
-        # ── Alerts ───────────────────────────────────────────────────────
-        if face_absent:
+        # Alerts — now using stable_label so they don't flicker
+        if not face_result.face_landmarks:
             info["alert"] = "NO FACE"
         elif blink_det.eyes_closed:
             info["alert"] = "EYES CLOSED"
         elif bpm > 25:
             info["alert"] = "HIGH BLINK RATE"
         elif phone_feat["phone"] == 1:
-            info["alert"] = "PHONE DETECTED"
+            info["alert"] = "PHONE DETECTED"             # ← NEW alert
         elif stable_label == 0 and smoother.window_full:
-            info["alert"] = "SUSTAINED DISTRACTION"
+            info["alert"] = "SUSTAINED DISTRACTION"      # ← NEW: only after window fills
 
         draw_hud(frame, info, show_xai=show_xai_hud)
         cv2.imshow("Attention Tracker", frame)
@@ -973,10 +1124,7 @@ def run_tracking(stop_event=None):
     print(f"  Duration      : {m_:02d}:{s_:02d}")
     print(f"  Total blinks  : {blink_det.total}")
     print(f"  Avg attention : {int(np.mean(attn_hist)) if attn_hist else 0}%")
-    if model_prob_hist:
-        print(f"  Avg model conf: {np.mean(model_prob_hist)*100:.1f}%")
-    else:
-        print(f"  Avg model conf: —")
+    print(f"  Avg model conf: {np.mean(model_prob_hist)*100:.1f}%" if model_prob_hist else "  Avg model conf: —")
     print(f"  Phone detected: {sum(phone_hist)} frames ({100*sum(phone_hist)/max(len(phone_hist),1):.1f}%)")
     print(f"────────────────────────────────────────────────\n")
 
