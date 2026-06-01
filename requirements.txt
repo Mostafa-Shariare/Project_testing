@@ -1,0 +1,4 @@
+-r requirements/backend.txt
+-r requirements/client.txt
+-r requirements/ml.txt
+-r requirements/dev.txt

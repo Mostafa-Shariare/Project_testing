@@ -23,9 +23,11 @@ import mediapipe as mp
 import numpy as np
 import os
 import time
+from pathlib import Path
 import collections
 import threading
 import urllib.request
+import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 import matplotlib
@@ -35,7 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-from attention_model import (
+from ml.model import (
     predict_attention,
     predict_proba_attention,
     explain_prediction,
@@ -58,7 +60,9 @@ FaceLandmarker        = mp.tasks.vision.FaceLandmarker
 FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
 VisionRunningMode     = mp.tasks.vision.RunningMode
 
-FACE_MODEL_PATH = "face_landmarker.task"
+_MEDIAPIPE_DIR = Path(__file__).resolve().parent / "assets" / "mediapipe"
+_MEDIAPIPE_DIR.mkdir(parents=True, exist_ok=True)
+FACE_MODEL_PATH = str(_MEDIAPIPE_DIR / "face_landmarker.task")
 FACE_MODEL_URL  = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
@@ -93,7 +97,7 @@ def get_face_landmarker():
 HandLandmarker        = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 
-HAND_MODEL_PATH = "hand_landmarker.task"
+HAND_MODEL_PATH = str(_MEDIAPIPE_DIR / "hand_landmarker.task")
 HAND_MODEL_URL  = (
     "https://storage.googleapis.com/mediapipe-models/"
     "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
@@ -929,11 +933,142 @@ class YOLOWorker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# State Reporter (Background POST Streamer) ← NEW
+# ══════════════════════════════════════════════════════════════════════════════
+class StateReporter:
+    def __init__(
+        self,
+        server_url: str,
+        student_name: str,
+        roll_number: str,
+        class_code: str,
+        join_code: str = "",
+        on_status=None,
+    ):
+        self.server_url = server_url.rstrip('/')
+        self.student_name = student_name
+        self.roll_number = roll_number.strip().upper()
+        self.class_code = class_code.strip().upper()
+        self.join_code = join_code.strip().upper()
+        self.on_status = on_status
+        self._lock = threading.Lock()
+        self._payload = {}
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._last_error = ""
+
+    def _set_status(self, msg: str):
+        self._last_error = msg
+        if self.on_status:
+            try:
+                self.on_status(msg)
+            except Exception:
+                pass
+
+    def _post_json(self, url: str, payload: dict, timeout: float = 2.0, retries: int = 3):
+        data = json.dumps(payload).encode("utf-8")
+        last_err = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(
+                    url, data=data, headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=timeout):
+                    self._set_status("● Connected to server")
+                    return True
+            except urllib.error.HTTPError as e:
+                last_err = e
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")
+                    detail = json.loads(err_body).get("detail", err_body)
+                except Exception:
+                    detail = str(e)
+                self._set_status(f"● Server error: {detail}")
+                if 400 <= e.code < 500:
+                    return False
+            except Exception as e:
+                last_err = e
+                self._set_status(f"● Connection failed (retry {attempt + 1}/{retries})")
+                time.sleep(min(0.5 * (attempt + 1), 2.0))
+        if last_err:
+            self._set_status("● Cannot reach server")
+        return False
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._report_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        # Send end-of-session signal to remove student from teacher grid immediately
+        self._post_json(
+            f"{self.server_url}/api/student/end",
+            {"roll_number": self.roll_number, "class_code": self.class_code},
+            timeout=1.5,
+            retries=1,
+        )
+
+    def update_state(self, info: dict):
+        with self._lock:
+            pitch = 0.0
+            yaw = 0.0
+            roll = 0.0
+            if info.get("pose"):
+                pitch, yaw, roll = info["pose"]
+
+            self._payload = {
+                "name": self.student_name,
+                "roll_number": self.roll_number,
+                "class_code": self.class_code,
+                "join_code": self.join_code,
+                "attention": info.get("attention", 0),
+                "model_prob_smoothed": float(info.get("model_prob_smoothed", 0.0)),
+                "model_prob_raw": float(info.get("model_prob_raw", 0.0)),
+                "model_pred_stable": int(info.get("model_pred_stable", -1)),
+                "phone_detected": bool(info.get("phone_detected", False)),
+                "hands_count": int(info.get("hands_count", 0)),
+                "blinks": int(info.get("blinks", 0)),
+                "blinks_per_min": float(info.get("blinks_per_min", 0.0)),
+                "gaze": str(info.get("gaze", "Center")),
+                "pose_pitch": float(pitch),
+                "pose_yaw": float(yaw),
+                "pose_roll": float(roll),
+                "alert": str(info.get("alert", ""))
+            }
+
+    def _report_loop(self):
+        while not self._stop_event.is_set():
+            time.sleep(1.0)
+            with self._lock:
+                if not self._payload:
+                    continue
+                payload_copy = dict(self._payload)
+            
+            self._post_json(f"{self.server_url}/api/student/update", payload_copy, timeout=2.0, retries=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main tracking loop
 # ══════════════════════════════════════════════════════════════════════════════
-def run_tracking(stop_event=None):
+def run_tracking(
+    stop_event=None,
+    student_name="Student",
+    roll_number="ROLL001",
+    class_code="CS101",
+    server_url="http://localhost:8000",
+    join_code="",
+    on_status=None,
+):
     if stop_event is None:
         stop_event = threading.Event()
+
+    reporter = StateReporter(
+        server_url, student_name, roll_number, class_code, join_code, on_status=on_status
+    )
+    reporter.start()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -970,9 +1105,11 @@ def run_tracking(stop_event=None):
 
     # Model PKL files
     import os as _os2
-    for pkl in ["attention_model.pkl", "attention_scaler.pkl", "attention_columns.pkl"]:
-        status = "[OK]" if _os2.path.exists(pkl) else "[!!] MISSING"
-        print(f"  {status} {pkl}")
+    from ml.paths import COLUMNS_FILE, MODEL_FILE, SCALER_FILE
+
+    for pkl in [MODEL_FILE, SCALER_FILE, COLUMNS_FILE]:
+        status = "[OK]" if pkl.exists() else "[!!] MISSING"
+        print(f"  {status} {pkl.name}")
 
     print("="*50 + "\n")
 
@@ -1105,6 +1242,8 @@ def run_tracking(stop_event=None):
         elif stable_label == 0 and smoother.window_full:
             info["alert"] = "SUSTAINED DISTRACTION"      # ← NEW: only after window fills
 
+        reporter.update_state(info)
+
         draw_hud(frame, info, show_xai=show_xai_hud)
         cv2.imshow("Attention Tracker", frame)
 
@@ -1117,6 +1256,8 @@ def run_tracking(stop_event=None):
 
     cap.release()
     cv2.destroyAllWindows()
+
+    reporter.stop()
 
     dur_   = time.time() - start_time
     m_, s_ = divmod(int(dur_), 60)
@@ -1141,6 +1282,22 @@ def run_tracking(stop_event=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Optional client config (client_config.json beside this script)
+# ══════════════════════════════════════════════════════════════════════════════
+CLIENT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+
+def load_client_config() -> dict:
+    if not CLIENT_CONFIG_PATH.exists():
+        return {}
+    try:
+        with CLIENT_CONFIG_PATH.open(encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Tkinter control panel
 # ══════════════════════════════════════════════════════════════════════════════
 class TrackerUI:
@@ -1149,10 +1306,18 @@ class TrackerUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Attention Tracker")
-        self.root.geometry("480x300")
+        self.root.title("Attention Tracker Client")
+        self.root.geometry("520x530")
         self.root.resizable(False, False)
         self.root.configure(bg=self.DARK)
+        
+        cfg = load_client_config()
+        self.name_var = tk.StringVar(value=cfg.get("student_name", "John Doe"))
+        self.roll_var = tk.StringVar(value=cfg.get("roll_number", "ROLL001"))
+        self.class_var = tk.StringVar(value=cfg.get("class_code", "CS-201"))
+        self.join_var = tk.StringVar(value=cfg.get("join_code", ""))
+        self.server_var = tk.StringVar(value=cfg.get("server_url", "http://localhost:8000"))
+        
         self.stop_event = threading.Event()
         self.worker     = None
         self._build()
@@ -1161,23 +1326,50 @@ class TrackerUI:
     def _build(self):
         hdr = tk.Frame(self.root, bg=self.PANEL, height=52)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="ATTENTION TRACKER  +  YOLOv8  +  SMOOTHING",
+        tk.Label(hdr, text="STUDENT ATTENTION MONITORING CLIENT",
                  font=("Courier New", 11, "bold"),
                  fg=self.ACCENT, bg=self.PANEL).pack(pady=14)
 
         body = tk.Frame(self.root, bg=self.DARK, padx=28, pady=18)
         body.pack(fill="both", expand=True)
 
-        tk.Label(body,
-                 text="New features:\n"
-                      "  • Phone detection via YOLOv8  (feature: phone / phone_con)\n"
-                      "  • Hand count via MediaPipe Hands  (feature: no_of_hand)\n"
-                      "  • 15-frame temporal smoother  (eliminates label flicker)\n\n"
-                      "Keys:  M = mesh   X = xai   Y = yolo boxes   Q = quit",
-                 font=("Courier New", 9), fg=self.MUTED, bg=self.DARK,
-                 justify="left").pack(anchor="w", pady=(0, 12))
+        # Inputs Grid
+        input_frame = tk.Frame(body, bg=self.DARK)
+        input_frame.pack(fill="x", pady=(0, 15))
 
-        self.status_var = tk.StringVar(value="● Idle")
+        def _lbl(parent, txt):
+            return tk.Label(parent, text=txt, font=("Courier New", 9, "bold"), fg=self.MUTED, bg=self.DARK)
+
+        def _entry(parent, var):
+            return tk.Entry(parent, textvariable=var, font=("Courier New", 9), fg=self.WHITE, bg=self.PANEL, insertbackground=self.WHITE, relief="flat", bd=3)
+
+        _lbl(input_frame, "Student Name:").grid(row=0, column=0, sticky="w", pady=4)
+        _entry(input_frame, self.name_var).grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
+
+        _lbl(input_frame, "Roll Number:").grid(row=1, column=0, sticky="w", pady=4)
+        _entry(input_frame, self.roll_var).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
+
+        _lbl(input_frame, "Class Code:  ").grid(row=2, column=0, sticky="w", pady=4)
+        _entry(input_frame, self.class_var).grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=4)
+
+        _lbl(input_frame, "Join Code:   ").grid(row=3, column=0, sticky="w", pady=4)
+        _entry(input_frame, self.join_var).grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=4)
+
+        _lbl(input_frame, "Server URL:  ").grid(row=4, column=0, sticky="w", pady=4)
+        _entry(input_frame, self.server_var).grid(row=4, column=1, sticky="ew", padx=(10, 0), pady=4)
+
+        input_frame.columnconfigure(1, weight=1)
+
+        tk.Label(body,
+                 text="Instructions:\n"
+                      "  1. Enter your details and target dashboard URL.\n"
+                      "  2. Click 'Start' to open the webcam stream.\n"
+                      "  3. Press 'Q' or 'ESC' in the stream to close.\n"
+                      "Hotkeys: M=mesh, X=xai, Y=yolo boxes",
+                 font=("Courier New", 9), fg=self.MUTED, bg=self.DARK,
+                 justify="left").pack(anchor="w", pady=(0, 15))
+
+        self.status_var = tk.StringVar(value="● Offline")
         self._sl = tk.Label(body, textvariable=self.status_var,
                             font=("Courier New", 10, "bold"),
                             fg=self.MUTED, bg=self.DARK)
@@ -1205,8 +1397,33 @@ class TrackerUI:
         self._sl.config(fg=color)
 
     def _run_tracker(self):
-        ok = run_tracking(self.stop_event)
+        name = self.name_var.get().strip()
+        roll = self.roll_var.get().strip().upper()
+        code = self.class_var.get().strip() or "Class"
+        join = self.join_var.get().strip()
+        server = self.server_var.get().strip() or "http://localhost:8000"
+
+        if not name or not roll:
+            self.root.after(0, lambda: self._on_validation_error())
+            return
+
+        ok = run_tracking(
+            self.stop_event,
+            student_name=name,
+            roll_number=roll,
+            class_code=code,
+            server_url=server,
+            join_code=join,
+            on_status=lambda msg: self.root.after(0, lambda m=msg: self._set_status(m, self.ACCENT)),
+        )
         self.root.after(0, lambda: self._on_finished(ok))
+
+    def _on_validation_error(self):
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self.worker = None
+        self._set_status("● Missing fields", self.RED)
+        messagebox.showerror("Validation", "Student Name and Roll Number are required.")
 
     def _on_finished(self, ok):
         self.start_btn.config(state="normal")
@@ -1222,6 +1439,25 @@ class TrackerUI:
     def start_tracking(self):
         if self.worker and self.worker.is_alive():
             return
+        name = self.name_var.get().strip()
+        roll = self.roll_var.get().strip()
+        if not name or not roll:
+            messagebox.showerror("Validation", "Student Name and Roll Number are required.")
+            return
+
+        consent = messagebox.askyesno(
+            "Privacy & consent",
+            "This app uses your webcam locally to estimate attention.\n\n"
+            "• Video is processed on this computer only\n"
+            "• Only attention scores and alerts are sent to the server\n"
+            "• No video recordings are uploaded\n\n"
+            "Do you consent to start monitoring?",
+            icon="warning",
+        )
+        if not consent:
+            self._set_status("● Consent required", self.MUTED)
+            return
+
         self.stop_event.clear()
         self._set_status("● Running…", self.ACCENT)
         self.start_btn.config(state="disabled")
@@ -1242,5 +1478,9 @@ class TrackerUI:
         self.root.mainloop()
 
 
-if __name__ == "__main__":
+def main():
     TrackerUI().run()
+
+
+if __name__ == "__main__":
+    main()

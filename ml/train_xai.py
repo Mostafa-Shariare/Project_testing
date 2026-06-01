@@ -42,12 +42,22 @@ import joblib
 warnings.filterwarnings("ignore")
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-MODEL_PATH   = "attention_model.pkl"
-SCALER_PATH  = "attention_scaler.pkl"
-COLS_PATH    = "attention_columns.pkl"
-DATASET_PATH = "attention_detection_dataset_v1.csv"
-OUT_DIR      = "xai_outputs"
+from ml.paths import (
+    COLUMNS_FILE,
+    DATASET_FILE,
+    MODEL_FILE,
+    SCALER_FILE,
+    XAI_OUTPUT_DIR,
+)
+
+MODEL_PATH = str(MODEL_FILE)
+SCALER_PATH = str(SCALER_FILE)
+COLS_PATH = str(COLUMNS_FILE)
+DATASET_PATH = str(DATASET_FILE)
+OUT_DIR = str(XAI_OUTPUT_DIR)
 os.makedirs(OUT_DIR, exist_ok=True)
+ARTIFACTS_DIR = MODEL_FILE.parent
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
 # ─── Publication style ────────────────────────────────────────────────────────
 plt.rcParams.update({

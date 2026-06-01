@@ -9,21 +9,22 @@ Public API:
     explain_prediction(input_features: dict) -> dict
 
 All functions load model artifacts lazily and cache them in memory.
-Compatible with the training pipeline in attention_xai_pipeline.py.
+Compatible with the training pipeline in ml.train_xai.
 """
 
-import os
 import numpy as np
 import pandas as pd
 import joblib
 import warnings
 
+from ml.paths import COLUMNS_FILE, MODEL_FILE, SCALER_FILE
+
 warnings.filterwarnings("ignore")
 
 # ── Artifact paths ─────────────────────────────────────────────────────────────
-_MODEL_PATH  = os.path.join(os.path.dirname(__file__), "attention_model.pkl")
-_SCALER_PATH = os.path.join(os.path.dirname(__file__), "attention_scaler.pkl")
-_COLS_PATH   = os.path.join(os.path.dirname(__file__), "attention_columns.pkl")
+_MODEL_PATH = MODEL_FILE
+_SCALER_PATH = SCALER_FILE
+_COLS_PATH = COLUMNS_FILE
 
 # ── Lazy-loaded singletons ─────────────────────────────────────────────────────
 _model            = None
@@ -35,9 +36,9 @@ _shap_explainer   = None
 def _load_artifacts():
     global _model, _scaler, _expected_columns
     if _model is None:
-        if not all(os.path.exists(p) for p in [_MODEL_PATH, _SCALER_PATH, _COLS_PATH]):
+        if not all(p.exists() for p in [_MODEL_PATH, _SCALER_PATH, _COLS_PATH]):
             raise FileNotFoundError(
-                "Model artifacts not found. Run attention_xai_pipeline.py first.\n"
+                "Model artifacts not found. Run: python -m ml.train_xai\n"
                 f"  Expected: {_MODEL_PATH}, {_SCALER_PATH}, {_COLS_PATH}"
             )
         _model            = joblib.load(_MODEL_PATH)

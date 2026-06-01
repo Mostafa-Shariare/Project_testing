@@ -39,7 +39,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import FancyBboxPatch
 
-from attention_model import (
+from ml.model import (
     predict_attention,
     predict_proba_attention,
     explain_prediction,
