@@ -25,6 +25,12 @@ def rate_limit(key: str, max_calls: int, window_sec: float) -> None:
     _rate_buckets[key] = bucket
 
 
+def rate_limit_ip(ip: str, username: str, max_calls: int, window_sec: float) -> None:
+    """Rate limit by IP and username combined — prevents brute-force across accounts."""
+    rate_limit(f"ip:{ip}", max_calls * 2, window_sec)
+    rate_limit(f"auth:{username}", max_calls, window_sec)
+
+
 def create_token(username: str) -> str:
     payload = {
         "sub": username,

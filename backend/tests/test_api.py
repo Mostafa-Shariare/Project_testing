@@ -72,3 +72,33 @@ def test_student_telemetry(auth_headers):
     )
     assert hist.status_code == 200
     assert len(hist.json()) >= 1
+
+
+def test_student_verify_join_code(auth_headers):
+    cls = client.post(
+        "/api/classes",
+        json={"class_code": CLASS_CODE + "V", "display_name": "Verify Class"},
+        headers=auth_headers,
+    ).json()
+
+    ok = client.post(
+        "/api/student/verify",
+        json={
+            "class_code": cls["class_code"],
+            "join_code": cls["join_code"],
+            "roll_number": "R002",
+            "name": "Verify Student",
+        },
+    )
+    assert ok.status_code == 200
+
+    bad = client.post(
+        "/api/student/verify",
+        json={
+            "class_code": cls["class_code"],
+            "join_code": "WRONG1",
+            "roll_number": "R002",
+            "name": "Verify Student",
+        },
+    )
+    assert bad.status_code == 403

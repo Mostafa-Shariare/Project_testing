@@ -13,12 +13,12 @@ from sklearn.model_selection import train_test_split
 from ml.paths import COLUMNS_FILE, DATASET_FILE, MODEL_FILE, SCALER_FILE
 
 
+from ml.train_xai import preprocess as _preprocess_df
+
 def preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     """Match training preprocessing from ml.train_xai."""
-    df = df.fillna(0)
     y = df["label"].astype(int)
-    X = df.drop(columns=["label"], errors="ignore")
-    X = pd.get_dummies(X, columns=["pose"], drop_first=False)
+    X = _preprocess_df(df)
     return X, y
 
 

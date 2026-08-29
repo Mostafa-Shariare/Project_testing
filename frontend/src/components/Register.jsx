@@ -38,43 +38,25 @@ export default function Register({ onSwitchLogin }) {
 
   return (
     <div className="auth-screen">
-      <div className="auth-card glass">
-        <div className="auth-logo">📋</div>
-        <h1>Register Teacher</h1>
-        <p className="auth-sub">Create an account to monitor student sessions</p>
+      <div className="auth-card card">
+        <img src="/visoria-logo.jpeg" alt="Visoria" className="auth-logo-img" />
+        <h1>Create Account</h1>
+        <p className="auth-sub">Register to access the attention monitoring dashboard</p>
         <form onSubmit={handleSubmit} className="auth-form">
           <label>
             Username
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              autoComplete="username"
-              required
-            />
+            <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" required />
           </label>
           <label>
             Password
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="new-password"
-              required
-            />
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required />
           </label>
           <label>
             Confirm Password
-            <input
-              type="password"
-              value={confirm}
-              onChange={(e) => setConfirm(e.target.value)}
-              autoComplete="new-password"
-              required
-            />
+            <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" required />
           </label>
           {error && <p className="auth-error">{error}</p>}
-          {success && <p className="auth-success">{success}</p>}
+          {success && <p className="save-toast" style={{ position: 'static' }}>{success}</p>}
           <button type="submit" className="btn btn-primary" disabled={loading}>
             {loading ? 'Creating…' : 'Register'}
           </button>

@@ -39,6 +39,8 @@ import shap
 from lime.lime_tabular import LimeTabularExplainer
 import joblib
 
+from ml.model import explain_prediction
+
 warnings.filterwarnings("ignore")
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -433,108 +435,7 @@ def plot_shap_lime_comparison(shap_values, lime_results, feature_names, sample_i
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  DEPLOY-COMPATIBLE FUNCTIONS  (unchanged API)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def predict_attention(input_features: dict) -> int:
-    """Original prediction function – unchanged."""
-    if not all(os.path.exists(p) for p in [MODEL_PATH, SCALER_PATH, COLS_PATH]):
-        raise FileNotFoundError("Model artifacts missing. Run train_pipeline() first.")
-    model            = joblib.load(MODEL_PATH)
-    scaler           = joblib.load(SCALER_PATH)
-    expected_columns = joblib.load(COLS_PATH)
-
-    df = pd.DataFrame([input_features]).fillna(0)
-    if "pose" in df.columns:
-        df = pd.get_dummies(df, columns=["pose"])
-
-    df_aligned = pd.DataFrame(columns=expected_columns)
-    for col in expected_columns:
-        df_aligned[col] = df[col] if col in df.columns else 0
-    df_aligned = df_aligned.astype(float)
-
-    X_s = scaler.transform(df_aligned)
-    return int(model.predict(X_s)[0])
-
-
-def explain_prediction(input_features: dict, print_summary: bool = True) -> dict:
-    """
-    NEW: Returns a rich explanation dict for one prediction.
-
-    Returns
-    -------
-    {
-      "prediction":   int  (0 / 1),
-      "probability":  float (P(attentive)),
-      "shap_values":  dict  {feature: shap_value},
-      "top_positive": list  [(feature, value), …],   # push toward attentive
-      "top_negative": list  [(feature, value), …],   # push toward not attentive
-      "explanation_text": str
-    }
-    """
-    if not all(os.path.exists(p) for p in [MODEL_PATH, SCALER_PATH, COLS_PATH]):
-        raise FileNotFoundError("Model artifacts missing. Run train_pipeline() first.")
-
-    model            = joblib.load(MODEL_PATH)
-    scaler           = joblib.load(SCALER_PATH)
-    expected_columns = joblib.load(COLS_PATH)
-
-    df = pd.DataFrame([input_features]).fillna(0)
-    if "pose" in df.columns:
-        df = pd.get_dummies(df, columns=["pose"])
-
-    df_aligned = pd.DataFrame(columns=expected_columns)
-    for col in expected_columns:
-        df_aligned[col] = df[col] if col in df.columns else 0
-    df_aligned = df_aligned.astype(float)
-
-    X_s         = scaler.transform(df_aligned)
-    prediction  = int(model.predict(X_s)[0])
-    probability = float(model.predict_proba(X_s)[0][1])
-
-    # SHAP (TreeExplainer – fast, exact)
-    explainer   = shap.TreeExplainer(model)
-    shap_obj    = explainer(X_s)
-    sv          = shap_obj.values[0, :, 1]          # class-1 SHAP for attentive
-
-    shap_dict = dict(zip(expected_columns, sv.tolist()))
-    sorted_sv = sorted(shap_dict.items(), key=lambda x: x[1], reverse=True)
-    top_pos   = [(k, round(v, 4)) for k, v in sorted_sv if v > 0][:5]
-    top_neg   = [(k, round(v, 4)) for k, v in sorted_sv if v < 0][:5]
-
-    # Human-readable text
-    pred_str   = "Attentive" if prediction == 1 else "Not Attentive"
-    lines      = [
-        f"Prediction : {pred_str} (P_attentive = {probability:.3f})",
-        "",
-        "Factors supporting ATTENTION:",
-    ]
-    for f, v in top_pos:
-        lines.append(f"  +{v:+.4f}  {f}")
-    lines.append("\nFactors indicating DISTRACTION:")
-    for f, v in top_neg:
-        lines.append(f"  {v:+.4f}  {f}")
-    explanation_text = "\n".join(lines)
-
-    if print_summary:
-        print("\n" + "─"*55)
-        print("  PREDICTION EXPLANATION")
-        print("─"*55)
-        print(explanation_text)
-        print("─"*55)
-
-    return {
-        "prediction":        prediction,
-        "probability":       probability,
-        "shap_values":       shap_dict,
-        "top_positive":      top_pos,
-        "top_negative":      top_neg,
-        "explanation_text":  explanation_text,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9.  MASTER XAI RUNNER
+# 8.  MASTER XAI RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_xai_pipeline():

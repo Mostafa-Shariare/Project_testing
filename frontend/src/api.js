@@ -68,11 +68,29 @@ export function wsUrl(path) {
   return `${base}${path}${q}`;
 }
 
-export function exportHistoryUrl(classCode) {
-  const token = getToken();
+export function exportHistoryUrl(classCode, fromDate, toDate) {
   const base = API_BASE || '';
   const params = new URLSearchParams();
   if (classCode) params.set('class_code', classCode);
+  if (fromDate != null) params.set('from_date', String(fromDate));
+  if (toDate != null) params.set('to_date', String(toDate));
   const q = params.toString() ? `?${params.toString()}` : '';
   return `${base}/api/analytics/history/export${q}`;
+}
+
+export async function downloadReport(path, filename) {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || 'Download failed');
+  }
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }

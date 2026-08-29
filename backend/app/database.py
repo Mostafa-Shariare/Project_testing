@@ -14,10 +14,11 @@ teachers_collection = None
 classes_collection = None
 students_collection = None
 sessions_collection = None
+student_actions_collection = None
 
 
 def connect():
-    global client, db, teachers_collection, classes_collection, students_collection, sessions_collection
+    global client, db, teachers_collection, classes_collection, students_collection, sessions_collection, student_actions_collection
     try:
         client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=2000)
         db = client[settings.mongodb_db]
@@ -28,6 +29,7 @@ def connect():
         classes_collection = db["classes"]
         students_collection = db["students"]
         sessions_collection = db["sessions"]
+        student_actions_collection = db["student_actions"]
 
         _ensure_indexes()
         return True
@@ -39,6 +41,7 @@ def connect():
         classes_collection = None
         students_collection = None
         sessions_collection = None
+        student_actions_collection = None
         return False
 
 
@@ -84,17 +87,26 @@ def _ensure_indexes():
         )
         _safe(
             "sessions.start_time",
-            lambda: sessions_collection.create_index("start_time", ASCENDING),
+            lambda: sessions_collection.create_index([("start_time", ASCENDING)]),
         )
         if settings.session_ttl_days > 0:
             _safe(
                 "sessions.ttl",
                 lambda: sessions_collection.create_index(
-                    "start_time",
+                    [("start_time", ASCENDING)],
                     expireAfterSeconds=settings.session_ttl_days * 86400,
                     name="sessions_ttl",
                 ),
             )
+
+    if student_actions_collection is not None:
+        _safe(
+            "student_actions.class_roll",
+            lambda: student_actions_collection.create_index(
+                [("class_code", ASCENDING), ("roll_number", ASCENDING)],
+                unique=True,
+            ),
+        )
 
 
 def is_db_ready() -> bool:

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
+import { Plus } from 'lucide-react';
 import { apiFetch, getActiveClass, setActiveClass } from '../api';
 
-export default function ClassSelector({ onClassChange }) {
+export default function ClassSelector({ onClassChange, compact = false }) {
   const [classes, setClasses] = useState([]);
   const [selected, setSelected] = useState(getActiveClass());
   const [loading, setLoading] = useState(true);
@@ -72,9 +73,9 @@ export default function ClassSelector({ onClassChange }) {
   if (loading) return <div className="class-bar muted">Loading classes…</div>;
 
   return (
-    <div className="class-bar glass">
+    <div className={`class-bar ${compact ? 'compact' : 'card'}`} style={compact ? {} : { padding: 16, marginBottom: 16 }}>
       <label className="class-bar-label">
-        Active class
+        Class
         <select
           value={selected}
           onChange={(e) => handleSelect(e.target.value)}
@@ -91,38 +92,29 @@ export default function ClassSelector({ onClassChange }) {
 
       {activeClass && (
         <span className="join-code-pill" title="Share with students">
-          Join code: <strong>{activeClass.join_code}</strong>
+          Join: <strong>{activeClass.join_code}</strong>
         </span>
       )}
 
       <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowCreate((v) => !v)}>
-        {showCreate ? 'Cancel' : '+ New class'}
+        <Plus size={14} />
+        {showCreate ? 'Cancel' : 'New class'}
       </button>
 
       {error && <span className="class-error">{error}</span>}
 
       {showCreate && (
         <form className="create-class-form" onSubmit={handleCreate}>
-          <input
-            placeholder="Class code (e.g. CS201)"
-            value={newCode}
-            onChange={(e) => setNewCode(e.target.value)}
-            required
-          />
-          <input
-            placeholder="Display name"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            required
-          />
+          <input placeholder="Class code (e.g. CS201)" value={newCode} onChange={(e) => setNewCode(e.target.value)} required />
+          <input placeholder="Display name" value={newName} onChange={(e) => setNewName(e.target.value)} required />
           <button type="submit" className="btn btn-primary btn-sm">
             Create
           </button>
         </form>
       )}
 
-      {lastJoinCode && (
-        <p className="join-hint">
+      {lastJoinCode && !compact && (
+        <p className="join-hint muted">
           Class created. Student join code: <strong>{lastJoinCode}</strong>
         </p>
       )}

@@ -1,17 +1,36 @@
 import { useEffect, useState } from 'react';
+import {
+  Activity,
+  Brain,
+  Clock,
+  LayoutDashboard,
+  LogOut,
+  Settings,
+  Users,
+  UserPlus,
+} from 'lucide-react';
 import './App.css';
 import { apiFetch, clearAuth, getActiveClass, getToken, getUsername } from './api';
 import Login from './components/Login';
 import Register from './components/Register';
 import LiveMonitor from './components/LiveMonitor';
 import HistoryPanel from './components/HistoryPanel';
+import SettingsPanel from './components/SettingsPanel';
 import ClassSelector from './components/ClassSelector';
 import RosterPanel from './components/RosterPanel';
+import ErrorBoundary from './components/ErrorBoundary';
 
-function App() {
+const NAV = [
+  { id: 'overview', label: 'Live Monitor', icon: LayoutDashboard },
+  { id: 'history', label: 'History & Analytics', icon: Clock },
+  { id: 'roster', label: 'Roster', icon: UserPlus },
+  { id: 'settings', label: 'Settings', icon: Settings },
+];
+
+export default function App() {
   const [authed, setAuthed] = useState(!!getToken());
   const [authView, setAuthView] = useState('login');
-  const [tab, setTab] = useState('live');
+  const [tab, setTab] = useState('overview');
   const [username, setUsername] = useState(getUsername());
   const [activeClass, setActiveClass] = useState(getActiveClass());
   const [authError, setAuthError] = useState('');
@@ -57,63 +76,85 @@ function App() {
     );
   }
 
+  const currentNav = NAV.find((n) => n.id === tab);
+
   return (
-    <div className="app-container">
-      <header className="app-header">
-        <div className="header-logo">
-          <div className="logo-icon">🎓</div>
-          <div className="logo-text">
-            <h1>Attention Monitor</h1>
-            <span>Teacher Portal · {username}</span>
+    <div className="dashboard-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <img src="/visoria-logo.jpeg" alt="Visoria" className="brand-logo-img" />
+          <div>
+            <strong>Visoria</strong>
+            <span>Classroom Monitor</span>
           </div>
         </div>
-        <nav className="header-tabs">
-          <button
-            type="button"
-            className={`tab-btn ${tab === 'live' ? 'active' : ''}`}
-            onClick={() => setTab('live')}
-          >
-            Live Monitor
-          </button>
-          <button
-            type="button"
-            className={`tab-btn ${tab === 'history' ? 'active' : ''}`}
-            onClick={() => setTab('history')}
-          >
-            History
-          </button>
-          <button
-            type="button"
-            className={`tab-btn ${tab === 'roster' ? 'active' : ''}`}
-            onClick={() => setTab('roster')}
-          >
-            Roster
-          </button>
+
+        <nav className="sidebar-nav">
+          {NAV.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              className={`nav-item ${tab === id ? 'active' : ''}`}
+              onClick={() => setTab(id)}
+            >
+              <Icon size={18} strokeWidth={2} />
+              {label}
+            </button>
+          ))}
         </nav>
-        <div className="header-controls">
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>
-            Logout
+
+        <div className="sidebar-footer">
+          <div className="sidebar-user">
+            <div className="user-avatar">{username.slice(0, 2).toUpperCase()}</div>
+            <div>
+              <strong>{username}</strong>
+              <span>Teacher</span>
+            </div>
+          </div>
+          <button type="button" className="nav-item logout-btn" onClick={handleLogout}>
+            <LogOut size={18} />
+            Sign out
           </button>
         </div>
-      </header>
+      </aside>
 
-      <ClassSelector onClassChange={setActiveClass} />
-
-      <main className="app-main">
-        {!activeClass ? (
-          <div className="empty-class-prompt glass">
-            <p>Create or select a class above to start monitoring students.</p>
+      <div className="main-area">
+        <header className="topbar">
+          <div className="topbar-left">
+            <Activity size={18} className="topbar-icon" />
+            <div>
+              <h1 className="topbar-title">{currentNav?.label || 'Dashboard'}</h1>
+            </div>
           </div>
-        ) : tab === 'live' ? (
-          <LiveMonitor classCode={activeClass} key={activeClass} />
-        ) : tab === 'history' ? (
-          <HistoryPanel classCode={activeClass} key={`hist-${activeClass}`} />
-        ) : (
-          <RosterPanel classCode={activeClass} key={`roster-${activeClass}`} />
-        )}
-      </main>
+          <ClassSelector onClassChange={setActiveClass} compact />
+        </header>
+
+        <main className="main-content">
+          <ErrorBoundary>
+          {!activeClass ? (
+            <div className="empty-state card">
+              <Brain size={48} strokeWidth={1.5} className="empty-icon" />
+              <h2>Select a class to begin</h2>
+              <p>Choose a class from the dropdown above.</p>
+            </div>
+          ) : tab === 'overview' ? (
+            <LiveMonitor
+              classCode={activeClass}
+              key={activeClass}
+              onViewStudentHistory={(roll) => {
+                setTab('history');
+              }}
+            />
+          ) : tab === 'history' ? (
+            <HistoryPanel classCode={activeClass} key={`hist-${activeClass}`} />
+          ) : tab === 'settings' ? (
+            <SettingsPanel classCode={activeClass} key={`set-${activeClass}`} />
+          ) : (
+            <RosterPanel classCode={activeClass} key={`roster-${activeClass}`} />
+          )}
+          </ErrorBoundary>
+        </main>
+      </div>
     </div>
   );
 }
-
-export default App;

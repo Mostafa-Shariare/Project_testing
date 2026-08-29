@@ -27,10 +27,10 @@ export default function Login({ onSuccess, onSwitchRegister }) {
 
   return (
     <div className="auth-screen">
-      <div className="auth-card glass">
-        <div className="auth-logo">🎓</div>
-        <h1>Teacher Login</h1>
-        <p className="auth-sub">Access the live attention monitoring dashboard</p>
+      <div className="auth-card card">
+        <img src="/visoria-logo.jpeg" alt="Visoria" className="auth-logo-img" />
+        <h1>Visoria</h1>
+        <p className="auth-sub">AI-powered classroom attention monitoring</p>
         <form onSubmit={handleSubmit} className="auth-form">
           <label>
             Username

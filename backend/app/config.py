@@ -2,7 +2,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -34,10 +34,21 @@ class Settings(BaseSettings):
     history_limit: int = Field(default=50, alias="HISTORY_LIMIT")
     session_ttl_days: int = Field(default=90, alias="SESSION_TTL_DAYS")
 
+    attention_threshold: int = Field(default=50, alias="ATTENTION_THRESHOLD")
     auth_rate_limit: int = Field(default=20, alias="AUTH_RATE_LIMIT")
     auth_rate_window_sec: int = Field(default=60, alias="AUTH_RATE_WINDOW_SEC")
     telemetry_rate_limit: int = Field(default=120, alias="TELEMETRY_RATE_LIMIT")
     telemetry_rate_window_sec: int = Field(default=60, alias="TELEMETRY_RATE_WINDOW_SEC")
+
+    @model_validator(mode="after")
+    def _reject_known_jwt_secret_in_production(self):
+        if self.environment.lower() == "production":
+            if not self.jwt_secret or self.jwt_secret == DEV_JWT_PLACEHOLDER:
+                raise ValueError(
+                    "JWT_SECRET must be set to a strong, non-default value "
+                    "when ENVIRONMENT=production"
+                )
+        return self
 
     @property
     def is_production(self) -> bool:
@@ -50,10 +61,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    settings = Settings()
-    if settings.is_production:
-        if not settings.jwt_secret or settings.jwt_secret == DEV_JWT_PLACEHOLDER:
-            raise RuntimeError(
-                "JWT_SECRET must be set to a strong value when ENVIRONMENT=production"
-            )
-    return settings
+    return Settings()

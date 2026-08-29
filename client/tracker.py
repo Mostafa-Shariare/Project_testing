@@ -12,10 +12,15 @@ New in this version
 
 Controls
 ────────
-  M         — Toggle 478-point landmark mesh
-  X         — Toggle XAI reason overlay
-  Y         — Toggle YOLO detection boxes
-  Q / ESC   — Quit and show dashboard
+  M  — Toggle face mesh
+  Y  — Toggle phone bounding boxes
+  H  — Toggle head pose markers
+  I  — Toggle iris markers
+  L  — Toggle hand landmarks
+  B  — Toggle face bounding box
+  X  — Toggle XAI insights
+  P  — Toggle CV pipeline panel
+  Q / ESC — Quit and show dashboard
 """
 
 import cv2
@@ -41,6 +46,13 @@ from ml.model import (
     predict_attention,
     predict_proba_attention,
     explain_prediction,
+)
+from client.ui_console import (
+    AnalysisConsole,
+    draw_face_bbox,
+    draw_hand_landmarks,
+    draw_head_pose_markers,
+    draw_iris_markers,
 )
 
 # Suppress verbose MediaPipe / TensorFlow Lite internal logs
@@ -201,14 +213,14 @@ def detect_phone(frame) -> tuple[dict, list]:
     return best_feat, draw_boxes
 
 
-def detect_hands(frame) -> int:
-    """Return the number of hands detected via MediaPipe HandLandmarker."""
-    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+def detect_hands(frame) -> tuple[int, list]:
+    """Return hand count and landmark lists for UI overlays."""
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     result = get_hand_model().detect(mp_img)
     if result.hand_landmarks:
-        return len(result.hand_landmarks)
-    return 0
+        return len(result.hand_landmarks), result.hand_landmarks
+    return 0, []
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -381,7 +393,7 @@ class BlinkDetector:
     def __init__(self):
         self.counter    = 0
         self.total      = 0
-        self.timestamps = collections.deque(maxlen=120)
+        self.timestamps = collections.deque(maxlen=1800)
 
     def update(self, ear: float):
         if ear < EAR_THRESH:
@@ -877,13 +889,19 @@ def show_dashboard(session_data: dict):
                 facecolor=fig.get_facecolor())
     plt.close("all")
     print(f"  Dashboard saved → {tmp.name}")
-    # Open with default OS image viewer (non-blocking)
-    if _sys.platform.startswith("win"):
-        _os.startfile(tmp.name)
-    elif _sys.platform == "darwin":
-        subprocess.Popen(["open", tmp.name])
-    else:
-        subprocess.Popen(["xdg-open", tmp.name])
+    # Try to open with default OS image viewer (non-blocking)
+    try:
+        if _sys.platform.startswith("win"):
+            os.startfile(tmp.name)
+        elif _sys.platform == "darwin":
+            subprocess.Popen(["open", tmp.name])
+        else:
+            subprocess.Popen(["xdg-open", tmp.name],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except Exception:
+        print(f"  Dashboard file saved at: {tmp.name}")
+        print("  (could not open automatically — open the file manually)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -933,6 +951,52 @@ class YOLOWorker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Session join verification (before webcam opens)
+# ══════════════════════════════════════════════════════════════════════════════
+def verify_session_join(
+    server_url: str,
+    class_code: str,
+    join_code: str,
+    roll_number: str = "",
+    name: str = "",
+) -> tuple[bool, str]:
+    """Return (ok, error_message). Does not open the webcam."""
+    server_url = server_url.rstrip("/")
+    class_code = class_code.strip().upper()
+    join_code = join_code.strip().upper()
+
+    if not class_code:
+        return False, "Class code is required"
+    if not join_code:
+        return False, "Join code is required"
+
+    payload = {
+        "class_code": class_code,
+        "join_code": join_code,
+        "roll_number": roll_number.strip().upper(),
+        "name": name.strip(),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"{server_url}/api/student/verify",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=4.0):
+            return True, ""
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+            detail = json.loads(err_body).get("detail", err_body)
+        except Exception:
+            detail = str(e)
+        return False, str(detail)
+    except Exception as e:
+        return False, f"Cannot reach server: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # State Reporter (Background POST Streamer) ← NEW
 # ══════════════════════════════════════════════════════════════════════════════
 class StateReporter:
@@ -944,6 +1008,7 @@ class StateReporter:
         class_code: str,
         join_code: str = "",
         on_status=None,
+        on_fatal_error=None,
     ):
         self.server_url = server_url.rstrip('/')
         self.student_name = student_name
@@ -951,6 +1016,7 @@ class StateReporter:
         self.class_code = class_code.strip().upper()
         self.join_code = join_code.strip().upper()
         self.on_status = on_status
+        self.on_fatal_error = on_fatal_error
         self._lock = threading.Lock()
         self._payload = {}
         self._thread = None
@@ -965,7 +1031,16 @@ class StateReporter:
             except Exception:
                 pass
 
-    def _post_json(self, url: str, payload: dict, timeout: float = 2.0, retries: int = 3):
+    def _post_json(
+        self,
+        url: str,
+        payload: dict,
+        timeout: float = 2.0,
+        retries: int = 3,
+        *,
+        fatal: bool = False,
+    ):
+        """Post JSON. Returns True on success, None if session not started (409), False on other errors."""
         data = json.dumps(payload).encode("utf-8")
         last_err = None
         for attempt in range(retries):
@@ -983,7 +1058,16 @@ class StateReporter:
                     detail = json.loads(err_body).get("detail", err_body)
                 except Exception:
                     detail = str(e)
+                # 409 = session not yet started by teacher — not a fatal error, keep waiting
+                if e.code == 409:
+                    self._set_status(f"● Waiting for teacher to start session…")
+                    return None  # Signal: retry later, not a crash
                 self._set_status(f"● Server error: {detail}")
+                if fatal and self.on_fatal_error and 400 <= e.code < 500:
+                    try:
+                        self.on_fatal_error(str(detail))
+                    except Exception:
+                        pass
                 if 400 <= e.code < 500:
                     return False
             except Exception as e:
@@ -1046,8 +1130,18 @@ class StateReporter:
                 if not self._payload:
                     continue
                 payload_copy = dict(self._payload)
-            
-            self._post_json(f"{self.server_url}/api/student/update", payload_copy, timeout=2.0, retries=2)
+
+            result = self._post_json(
+                f"{self.server_url}/api/student/update",
+                payload_copy,
+                timeout=2.0,
+                retries=2,
+                fatal=True,
+            )
+            # result is None when the teacher hasn't started the session yet (409).
+            # In this case we simply loop and retry — the tracker keeps running.
+            # result is False on a different fatal 4xx error, which stops the loop
+            # via on_fatal_error -> stop_event.set().
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1061,22 +1155,45 @@ def run_tracking(
     server_url="http://localhost:8000",
     join_code="",
     on_status=None,
+    session_flags=None,
 ):
     if stop_event is None:
         stop_event = threading.Event()
+    session_flags = session_flags if session_flags is not None else {}
+
+    ok, err = verify_session_join(
+        server_url, class_code, join_code, roll_number, student_name
+    )
+    if not ok:
+        session_flags["fatal_error"] = err
+        if on_status:
+            on_status(f"● Join failed: {err}")
+        return "join_denied"
+
+    def _fatal_session_error(detail: str):
+        session_flags["fatal_error"] = detail
+        stop_event.set()
 
     reporter = StateReporter(
-        server_url, student_name, roll_number, class_code, join_code, on_status=on_status
+        server_url,
+        student_name,
+        roll_number,
+        class_code,
+        join_code,
+        on_status=on_status,
+        on_fatal_error=_fatal_session_error,
     )
     reporter.start()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
+        reporter.stop()
         print("ERROR: Cannot open webcam.")
-        return False
+        return "webcam_error"
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     face_lmk   = get_face_landmarker()
 
@@ -1118,10 +1235,16 @@ def run_tracking(
     yolo_worker= YOLOWorker(every_n=6)                               # ← NEW
     xai_worker = XAIWorker(every_n=20)
 
-    show_mesh     = False
-    show_xai_hud  = True
-    show_yolo_box = True
-    start_time    = time.time()
+    show_mesh      = False
+    show_xai_hud   = True
+    show_yolo_box  = True
+    show_pose      = True
+    show_iris      = False
+    show_hands     = False
+    show_face_bbox = True
+    pipeline_open  = True
+    console        = AnalysisConsole()
+    start_time     = time.time()
 
     attn_hist        = []
     model_attn_hist  = []
@@ -1137,9 +1260,12 @@ def run_tracking(
         model_ok = False
         print(f"[WARN] Model unavailable: {e}")
 
+    _win = "AttentionAI Vision Console"
+    cv2.namedWindow(_win, cv2.WINDOW_AUTOSIZE)
+
     while not stop_event.is_set():
         ret, frame = cap.read()
-        if not ret:
+        if not ret or stop_event.is_set():
             break
 
         frame = cv2.flip(frame, 1)
@@ -1150,7 +1276,7 @@ def run_tracking(
         phone_feat, phone_boxes = yolo_worker.get()
 
         # ── Hand detection (fast on CPU, every frame) ────────────────────
-        no_of_hand = detect_hands(frame)
+        no_of_hand, hand_landmarks = detect_hands(frame)
 
         # ── Face landmarks ───────────────────────────────────────────────
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1173,14 +1299,20 @@ def run_tracking(
         else:
             h_score = heuristic_attention(0, 0, gaze_dir, ear_avg)
 
-        # ── Draw overlays ────────────────────────────────────────────────
+        # ── Draw CV overlays on camera frame ─────────────────────────────
         if face_result.face_landmarks:
             lms = face_result.face_landmarks[0]
             if show_mesh:
                 draw_mesh(frame, lms, W, H)
-            for idx, col in [(1,(0,255,255)),(33,(255,200,0)),(263,(255,200,0))]:
-                cv2.circle(frame, (int(lms[idx].x*W), int(lms[idx].y*H)),
-                           4, col, -1, cv2.LINE_AA)
+            if show_face_bbox:
+                draw_face_bbox(frame, lms, W, H)
+            if show_pose:
+                draw_head_pose_markers(frame, lms, W, H)
+            if show_iris:
+                draw_iris_markers(frame, lms, W, H)
+
+        if show_hands and hand_landmarks:
+            draw_hand_landmarks(frame, hand_landmarks, W, H)
 
         draw_yolo_boxes(frame, phone_boxes, show_yolo_box)
 
@@ -1244,41 +1376,87 @@ def run_tracking(
 
         reporter.update_state(info)
 
-        draw_hud(frame, info, show_xai=show_xai_hud)
-        cv2.imshow("Attention Tracker", frame)
+        if stop_event.is_set():
+            break
+
+        toggles = {
+            "mesh": show_mesh,
+            "bbox": show_yolo_box,
+            "face": show_face_bbox,
+            "pose": show_pose,
+            "iris": show_iris,
+            "hands": show_hands,
+            "xai": show_xai_hud,
+            "pipeline": pipeline_open,
+        }
+        display = console.compose(
+            frame,
+            info,
+            toggles,
+            pipeline_collapsed=not pipeline_open,
+        )
+        cv2.imshow(_win, display)
+
+        if stop_event.is_set():
+            break
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q"), ord("Q")):
-            stop_event.set(); break
-        elif key in (ord("m"), ord("M")): show_mesh     = not show_mesh
-        elif key in (ord("x"), ord("X")): show_xai_hud  = not show_xai_hud
-        elif key in (ord("y"), ord("Y")): show_yolo_box = not show_yolo_box
+            stop_event.set()
+            break
+        elif stop_event.is_set():
+            break
+        elif key in (ord("m"), ord("M")):
+            show_mesh = not show_mesh
+        elif key in (ord("x"), ord("X")):
+            show_xai_hud = not show_xai_hud
+        elif key in (ord("y"), ord("Y")):
+            show_yolo_box = not show_yolo_box
+        elif key in (ord("h"), ord("H")):
+            show_pose = not show_pose
+        elif key in (ord("i"), ord("I")):
+            show_iris = not show_iris
+        elif key in (ord("l"), ord("L")):
+            show_hands = not show_hands
+        elif key in (ord("b"), ord("B")):
+            show_face_bbox = not show_face_bbox
+        elif key in (ord("p"), ord("P")):
+            pipeline_open = not pipeline_open
 
     cap.release()
     cv2.destroyAllWindows()
 
     reporter.stop()
 
+    ended_by_user = session_flags.get("end_by_user", False)
+    show_report = attn_hist and not ended_by_user and not session_flags.get("fatal_error")
+
     dur_   = time.time() - start_time
     m_, s_ = divmod(int(dur_), 60)
-    print(f"\n── Session Summary ─────────────────────────────")
-    print(f"  Duration      : {m_:02d}:{s_:02d}")
-    print(f"  Total blinks  : {blink_det.total}")
-    print(f"  Avg attention : {int(np.mean(attn_hist)) if attn_hist else 0}%")
-    print(f"  Avg model conf: {np.mean(model_prob_hist)*100:.1f}%" if model_prob_hist else "  Avg model conf: —")
-    print(f"  Phone detected: {sum(phone_hist)} frames ({100*sum(phone_hist)/max(len(phone_hist),1):.1f}%)")
-    print(f"────────────────────────────────────────────────\n")
+    if show_report:
+        print(f"\n── Session Summary ─────────────────────────────")
+        print(f"  Duration      : {m_:02d}:{s_:02d}")
+        print(f"  Total blinks  : {blink_det.total}")
+        print(f"  Avg attention : {int(np.mean(attn_hist)) if attn_hist else 0}%")
+        print(f"  Avg model conf: {np.mean(model_prob_hist)*100:.1f}%" if model_prob_hist else "  Avg model conf: —")
+        print(f"  Phone detected: {sum(phone_hist)} frames ({100*sum(phone_hist)/max(len(phone_hist),1):.1f}%)")
+        print(f"────────────────────────────────────────────────\n")
 
-    show_dashboard({
-        "duration_sec":           dur_,
-        "total_blinks":           blink_det.total,
-        "attention_series":       attn_hist,
-        "model_attention_series": model_attn_hist,
-        "model_prob_series":      model_prob_hist,
-        "blink_timeline":         blink_rate_hist,
-        "phone_series":           phone_hist,
-    })
-    return True
+        show_dashboard({
+            "duration_sec":           dur_,
+            "total_blinks":           blink_det.total,
+            "attention_series":       attn_hist,
+            "model_attention_series": model_attn_hist,
+            "model_prob_series":      model_prob_hist,
+            "blink_timeline":         blink_rate_hist,
+            "phone_series":           phone_hist,
+        })
+
+    if session_flags.get("fatal_error"):
+        return "join_denied"
+    if ended_by_user or stop_event.is_set():
+        return "stopped"
+    return "ok"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1301,15 +1479,21 @@ def load_client_config() -> dict:
 # Tkinter control panel
 # ══════════════════════════════════════════════════════════════════════════════
 class TrackerUI:
-    DARK = "#12141C"; PANEL = "#1E2130"; ACCENT = "#5AA0F0"
-    WHITE = "#EAEAF2"; MUTED = "#5C5E72"; GREEN = "#48C87A"; RED = "#E04040"
+    BG = "#F8FAFC"
+    PANEL = "#FFFFFF"
+    ACCENT = "#2563EB"
+    TEXT = "#0F172A"
+    MUTED = "#64748B"
+    GREEN = "#16A34A"
+    RED = "#DC2626"
+    BORDER = "#E2E8F0"
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Attention Tracker Client")
-        self.root.geometry("520x530")
+        self.root.title("AttentionAI — Student Client")
+        self.root.geometry("540x580")
         self.root.resizable(False, False)
-        self.root.configure(bg=self.DARK)
+        self.root.configure(bg=self.BG)
         
         cfg = load_client_config()
         self.name_var = tk.StringVar(value=cfg.get("student_name", "John Doe"))
@@ -1319,29 +1503,44 @@ class TrackerUI:
         self.server_var = tk.StringVar(value=cfg.get("server_url", "http://localhost:8000"))
         
         self.stop_event = threading.Event()
+        self.session_flags = {"end_by_user": False, "fatal_error": None}
         self.worker     = None
         self._build()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build(self):
-        hdr = tk.Frame(self.root, bg=self.PANEL, height=52)
+        hdr = tk.Frame(self.root, bg=self.PANEL, height=56, highlightbackground=self.BORDER, highlightthickness=1)
         hdr.pack(fill="x")
-        tk.Label(hdr, text="STUDENT ATTENTION MONITORING CLIENT",
-                 font=("Courier New", 11, "bold"),
-                 fg=self.ACCENT, bg=self.PANEL).pack(pady=14)
+        tk.Label(
+            hdr,
+            text="AttentionAI  ·  Vision Analysis Client",
+            font=("Segoe UI", 12, "bold"),
+            fg=self.ACCENT,
+            bg=self.PANEL,
+        ).pack(pady=16)
 
-        body = tk.Frame(self.root, bg=self.DARK, padx=28, pady=18)
+        body = tk.Frame(self.root, bg=self.BG, padx=28, pady=18)
         body.pack(fill="both", expand=True)
 
-        # Inputs Grid
-        input_frame = tk.Frame(body, bg=self.DARK)
+        input_frame = tk.Frame(body, bg=self.BG)
         input_frame.pack(fill="x", pady=(0, 15))
 
         def _lbl(parent, txt):
-            return tk.Label(parent, text=txt, font=("Courier New", 9, "bold"), fg=self.MUTED, bg=self.DARK)
+            return tk.Label(parent, text=txt, font=("Segoe UI", 9), fg=self.MUTED, bg=self.BG)
 
         def _entry(parent, var):
-            return tk.Entry(parent, textvariable=var, font=("Courier New", 9), fg=self.WHITE, bg=self.PANEL, insertbackground=self.WHITE, relief="flat", bd=3)
+            return tk.Entry(
+                parent,
+                textvariable=var,
+                font=("Segoe UI", 10),
+                fg=self.TEXT,
+                bg=self.PANEL,
+                insertbackground=self.TEXT,
+                relief="solid",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground=self.BORDER,
+            )
 
         _lbl(input_frame, "Student Name:").grid(row=0, column=0, sticky="w", pady=4)
         _entry(input_frame, self.name_var).grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
@@ -1360,35 +1559,50 @@ class TrackerUI:
 
         input_frame.columnconfigure(1, weight=1)
 
-        tk.Label(body,
-                 text="Instructions:\n"
-                      "  1. Enter your details and target dashboard URL.\n"
-                      "  2. Click 'Start' to open the webcam stream.\n"
-                      "  3. Press 'Q' or 'ESC' in the stream to close.\n"
-                      "Hotkeys: M=mesh, X=xai, Y=yolo boxes",
-                 font=("Courier New", 9), fg=self.MUTED, bg=self.DARK,
-                 justify="left").pack(anchor="w", pady=(0, 15))
+        tk.Label(
+            body,
+            text="Connect to your class session and launch the AI vision console.\n"
+                 "Press Start to open the webcam analysis window.\n"
+                 "Hotkeys: M mesh · Y bbox · H pose · I iris · L hands · P pipeline · Q quit",
+            font=("Segoe UI", 9),
+            fg=self.MUTED,
+            bg=self.BG,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 15))
 
-        self.status_var = tk.StringVar(value="● Offline")
-        self._sl = tk.Label(body, textvariable=self.status_var,
-                            font=("Courier New", 10, "bold"),
-                            fg=self.MUTED, bg=self.DARK)
+        self.status_var = tk.StringVar(value="● Ready")
+        self._sl = tk.Label(
+            body,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10, "bold"),
+            fg=self.MUTED,
+            bg=self.BG,
+        )
         self._sl.pack(anchor="w", pady=(0, 12))
 
-        row = tk.Frame(body, bg=self.DARK)
+        row = tk.Frame(body, bg=self.BG)
         row.pack(anchor="w")
 
-        def _btn(text, cmd, fg):
-            return tk.Button(row, text=text, command=cmd,
-                             font=("Courier New", 10, "bold"),
-                             fg=fg, bg=self.PANEL,
-                             activeforeground=fg, activebackground=self.PANEL,
-                             relief="flat", padx=20, pady=8,
-                             cursor="hand2", borderwidth=0)
+        def _btn(text, cmd, fg, bg=None):
+            return tk.Button(
+                row,
+                text=text,
+                command=cmd,
+                font=("Segoe UI", 10, "bold"),
+                fg="#FFFFFF" if bg else fg,
+                bg=bg or self.PANEL,
+                activeforeground="#FFFFFF" if bg else fg,
+                activebackground=bg or self.PANEL,
+                relief="flat",
+                padx=22,
+                pady=9,
+                cursor="hand2",
+                borderwidth=0,
+            )
 
-        self.start_btn = _btn("▶  Start", self.start_tracking, self.GREEN)
+        self.start_btn = _btn("▶  Start Session", self.start_tracking, self.GREEN, self.ACCENT)
         self.start_btn.grid(row=0, column=0, padx=(0, 10))
-        self.stop_btn  = _btn("■  Stop",  self.stop_tracking,  self.RED)
+        self.stop_btn = _btn("■  End Session", self.stop_tracking, self.RED, self.RED)
         self.stop_btn.grid(row=0, column=1)
         self.stop_btn.config(state="disabled")
 
@@ -1415,6 +1629,7 @@ class TrackerUI:
             server_url=server,
             join_code=join,
             on_status=lambda msg: self.root.after(0, lambda m=msg: self._set_status(m, self.ACCENT)),
+            session_flags=self.session_flags,
         )
         self.root.after(0, lambda: self._on_finished(ok))
 
@@ -1425,24 +1640,38 @@ class TrackerUI:
         self._set_status("● Missing fields", self.RED)
         messagebox.showerror("Validation", "Student Name and Roll Number are required.")
 
-    def _on_finished(self, ok):
+    def _on_finished(self, result):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.worker = None
         self.stop_event.clear()
-        if ok:
+        self.session_flags["end_by_user"] = False
+
+        if result == "ok":
             self._set_status("● Session completed", self.GREEN)
-        else:
+        elif result == "stopped":
+            self._set_status("● Session ended", self.MUTED)
+        elif result == "join_denied":
+            self._set_status("● Invalid join code", self.RED)
+            detail = self.session_flags.get("fatal_error") or "Could not join this class session."
+            messagebox.showerror("Join Failed", detail)
+        elif result == "webcam_error":
             self._set_status("● Webcam error", self.RED)
             messagebox.showerror("Error", "Cannot open webcam.")
+        else:
+            self._set_status("● Session ended", self.MUTED)
 
     def start_tracking(self):
         if self.worker and self.worker.is_alive():
             return
         name = self.name_var.get().strip()
         roll = self.roll_var.get().strip()
+        join = self.join_var.get().strip()
         if not name or not roll:
             messagebox.showerror("Validation", "Student Name and Roll Number are required.")
+            return
+        if not join:
+            messagebox.showerror("Validation", "Join code is required to start a session.")
             return
 
         consent = messagebox.askyesno(
@@ -1458,8 +1687,10 @@ class TrackerUI:
             self._set_status("● Consent required", self.MUTED)
             return
 
+        self.session_flags["end_by_user"] = False
+        self.session_flags["fatal_error"] = None
         self.stop_event.clear()
-        self._set_status("● Running…", self.ACCENT)
+        self._set_status("● Verifying join code…", self.ACCENT)
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.worker = threading.Thread(target=self._run_tracker, daemon=True)
@@ -1467,10 +1698,12 @@ class TrackerUI:
 
     def stop_tracking(self):
         if self.worker and self.worker.is_alive():
-            self._set_status("● Stopping…", self.MUTED)
+            self.session_flags["end_by_user"] = True
+            self._set_status("● Ending session…", self.MUTED)
             self.stop_event.set()
 
     def on_close(self):
+        self.session_flags["end_by_user"] = True
         self.stop_event.set()
         self.root.destroy()
 

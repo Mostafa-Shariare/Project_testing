@@ -1,29 +1,74 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Filler,
-  Tooltip,
-} from 'chart.js';
-import { Line } from 'react-chartjs-2';
+  Activity,
+  AlertTriangle,
+  Bell,
+  Brain,
+  Eye,
+  Maximize2,
+  Play,
+  Search,
+  SortAsc,
+  StopCircle,
+  Users,
+  Wifi,
+  WifiOff,
+  Zap,
+} from 'lucide-react';
 import { apiFetch, wsUrl } from '../api';
+import { useAlertNotifications } from '../hooks/useAlertNotifications';
+import { useStudentActions } from '../hooks/useStudentActions';
+import {
+  filterAndSortStudents,
+  formatDuration,
+  isBelowThreshold,
+  isCriticalAlert,
+  isMonitorAlert,
+} from '../utils/liveMonitorUtils';
 import StudentCard from './StudentCard';
+import StudentDetailModal from './StudentDetailModal';
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Filler, Tooltip);
+const TIMELINE_MAX = 60;
+const SPARKLINE_MAX = 15;
 
-const CHART_POINTS = 30;
+const VIEW_FILTERS = [
+  { id: 'all', label: 'All', icon: Users },
+  { id: 'alerts', label: 'Alerts', icon: AlertTriangle },
+  { id: 'distracted', label: 'Below Threshold', icon: Eye },
+  { id: 'offline', label: 'Offline', icon: WifiOff },
+];
 
-export default function LiveMonitor({ classCode }) {
+const SORT_OPTIONS = [
+  { id: 'attention-desc', label: 'Attention (high \u2192 low)' },
+  { id: 'attention-asc', label: 'Attention (low \u2192 high)' },
+  { id: 'name-asc', label: 'Name (A \u2192 Z)' },
+];
+
+export default function LiveMonitor({ classCode, onViewStudentHistory }) {
   const [students, setStudents] = useState({});
   const [search, setSearch] = useState('');
+  const [viewFilter, setViewFilter] = useState('all');
+  const [sortBy, setSortBy] = useState('attention-desc');
   const [wsStatus, setWsStatus] = useState('connecting');
   const [alerts, setAlerts] = useState([]);
+  const [classSession, setClassSession] = useState(null);
+  const [attentionThreshold, setAttentionThreshold] = useState(50);
+  const [selectedStudent, setSelectedStudent] = useState(null);
+  const [sessionTimelines, setSessionTimelines] = useState({});
+  const [sparklines, setSparklines] = useState({});
+  const [flashingRolls, setFlashingRolls] = useState({});
+  const [resetting, setResetting] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+  const [sessionElapsed, setSessionElapsed] = useState(0);
+
+  const monitorRef = useRef(null);
   const alertHistoryRef = useRef([]);
-  const chartDataRef = useRef(Array(CHART_POINTS).fill(null));
-  const [, bumpChart] = useState(0);
+  const prevAlertsRef = useRef({});
+  const attentionTimelinesRef = useRef({});
+  const sparklinesRef = useRef({});
+
+  const { getState, runAction } = useStudentActions(classCode);
 
   const studentList = useMemo(() => Object.values(students), [students]);
 
@@ -35,55 +80,152 @@ export default function LiveMonitor({ classCode }) {
   const kpis = useMemo(() => {
     const total = activeStudents.length;
     if (total === 0) {
-      return { total: 0, avg: 0, ratio: 0, alerts: 0 };
+      return { total: 0, avg: 0, focused: 0, alerts: 0 };
     }
     const sum = activeStudents.reduce((a, s) => a + (s.attention || 0), 0);
     const avg = Math.round(sum / total);
-    const attentive = activeStudents.filter((s) => s.model_pred_stable === 1).length;
-    const alertCount = activeStudents.filter((s) => s.alert).length;
-    return {
-      total,
-      avg,
-      ratio: Math.round((attentive / total) * 100),
-      alerts: alertCount,
+    const focused = activeStudents.filter((s) => !isBelowThreshold(s, attentionThreshold)).length;
+    const alertCount = activeStudents.filter(
+      (s) => isMonitorAlert(s.alert) && !getState(s.roll_number).suppress_alerts,
+    ).length;
+    return { total, avg, focused, alerts: alertCount };
+  }, [activeStudents, attentionThreshold, getState]);
+
+  const {
+    scrollToStudent,
+    highlightRoll,
+    notifyCritical,
+  } = useAlertNotifications({ classCode, activeStudents });
+
+  useEffect(() => {
+    setStudents({});
+    setAlerts([]);
+    setClassSession(null);
+    setSelectedStudent(null);
+    attentionTimelinesRef.current = {};
+    sparklinesRef.current = {};
+    setSessionTimelines({});
+    setSparklines({});
+    alertHistoryRef.current = [];
+    prevAlertsRef.current = {};
+    setSessionElapsed(0);
+  }, [classCode]);
+
+  useEffect(() => {
+    if (!classCode) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetch(`/api/classes/${encodeURIComponent(classCode)}/settings`);
+        if (!cancelled) {
+          setAttentionThreshold(data.attention_threshold ?? 50);
+        }
+      } catch {
+        /* defaults */
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
-  }, [activeStudents]);
+  }, [classCode]);
 
-  const filtered = useMemo(() => {
-    const q = search.toLowerCase().trim();
-    if (!q) return studentList;
-    return studentList.filter(
-      (s) =>
-        s.name?.toLowerCase().includes(q) ||
-        s.roll_number?.toLowerCase().includes(q) ||
-        s.class_code?.toLowerCase().includes(q),
-    );
-  }, [studentList, search]);
+  useEffect(() => {
+    const start = classSession?.start_time;
+    if (!start) {
+      setSessionElapsed(0);
+      return undefined;
+    }
+    const tick = () => setSessionElapsed(Math.max(0, Math.floor(Date.now() / 1000 - start)));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [classSession?.start_time]);
 
-  const pushAlert = useCallback((student) => {
-    const alertText = student.alert;
-    if (!alertText) return;
-    const key = `${student.roll_number}:${alertText}`;
-    const now = Date.now();
-    const hist = alertHistoryRef.current;
-    const idx = hist.findIndex((a) => a.key === key);
-    if (idx !== -1 && now - hist[idx].time < 12000) return;
+  const filtered = useMemo(
+    () =>
+      filterAndSortStudents(studentList, {
+        search,
+        viewFilter,
+        sortBy,
+        threshold: attentionThreshold,
+        suppressCheck: (roll) => getState(roll).suppress_alerts,
+      }),
+    [studentList, search, viewFilter, sortBy, attentionThreshold, getState],
+  );
 
-    if (idx !== -1) hist.splice(idx, 1);
-    hist.push({ key, time: now });
-    if (hist.length > 50) hist.shift();
+  const recordTimelines = useCallback((list) => {
+    const tl = attentionTimelinesRef.current;
+    const sp = sparklinesRef.current;
+    list.forEach((s) => {
+      const roll = s.roll_number;
+      if (s.status === 'active') {
+        if (!tl[roll]) tl[roll] = [];
+        tl[roll].push(s.attention ?? 0);
+        if (tl[roll].length > TIMELINE_MAX) tl[roll] = tl[roll].slice(-TIMELINE_MAX);
 
-    setAlerts((prev) => {
-      const item = {
-        id: `${key}-${now}`,
-        roll: student.roll_number,
-        name: student.name,
-        alert: alertText,
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-      };
-      return [item, ...prev].slice(0, 15);
+        if (!sp[roll]) sp[roll] = [];
+        sp[roll].push(s.attention ?? 0);
+        if (sp[roll].length > SPARKLINE_MAX) sp[roll] = sp[roll].slice(-SPARKLINE_MAX);
+      }
+    });
+    setSessionTimelines({ ...tl });
+    setSparklines({ ...sp });
+  }, []);
+
+  const detectAlertFlash = useCallback((list) => {
+    list.forEach((s) => {
+      const roll = s.roll_number;
+      const prev = prevAlertsRef.current[roll];
+      const cur = s.alert || '';
+      if (isMonitorAlert(cur) && cur !== prev) {
+        setFlashingRolls((f) => ({ ...f, [roll]: true }));
+        setTimeout(() => {
+          setFlashingRolls((f) => {
+            const next = { ...f };
+            delete next[roll];
+            return next;
+          });
+        }, 2500);
+      }
+      prevAlertsRef.current[roll] = cur;
     });
   }, []);
+
+  const pushFeedAlert = useCallback(
+    (student) => {
+      if (getState(student.roll_number).suppress_alerts) return;
+      const alertText = student.alert;
+      if (!isMonitorAlert(alertText)) return;
+      const key = `${student.roll_number}:${alertText}`;
+      const now = Date.now();
+      const hist = alertHistoryRef.current;
+      const idx = hist.findIndex((a) => a.key === key);
+      if (idx !== -1 && now - hist[idx].time < 12000) return;
+
+      if (idx !== -1) hist.splice(idx, 1);
+      hist.push({ key, time: now });
+      if (hist.length > 50) hist.shift();
+
+      if (isCriticalAlert(alertText)) notifyCritical(student);
+
+      setAlerts((prev) => {
+        const item = {
+          id: `${key}-${now}`,
+          roll: student.roll_number,
+          name: student.name,
+          alert: alertText,
+          critical: isCriticalAlert(alertText),
+          time: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          }),
+        };
+        return [item, ...prev].slice(0, 15);
+      });
+    },
+    [notifyCritical, getState],
+  );
 
   useEffect(() => {
     let socket;
@@ -104,14 +246,15 @@ export default function LiveMonitor({ classCode }) {
             next[s.roll_number || s.name] = s;
           });
           setStudents(next);
-          const active = list.filter((s) => s.status === 'active');
-          active.forEach(pushAlert);
-          const avg =
-            active.length > 0
-              ? Math.round(active.reduce((a, s) => a + (s.attention || 0), 0) / active.length)
-              : null;
-          chartDataRef.current = [...chartDataRef.current.slice(1), avg];
-          bumpChart((n) => n + 1);
+          if (data.class_session) {
+            setClassSession(data.class_session);
+            if (data.class_session.attention_threshold != null) {
+              setAttentionThreshold(data.class_session.attention_threshold);
+            }
+          }
+          recordTimelines(list);
+          detectAlertFlash(list);
+          list.filter((s) => s.status === 'active').forEach(pushFeedAlert);
         } catch {
           /* ignore */
         }
@@ -129,165 +272,331 @@ export default function LiveMonitor({ classCode }) {
       clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [pushAlert, classCode]);
+  }, [pushFeedAlert, classCode, recordTimelines, detectAlertFlash]);
 
-  const chartConfig = {
-    labels: Array(CHART_POINTS).fill(''),
-    datasets: [
-      {
-        label: 'Class Avg Attention (%)',
-        data: [...chartDataRef.current],
-        borderColor: '#5aa0f0',
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.3,
-        fill: true,
-        backgroundColor: 'rgba(90, 160, 240, 0.1)',
-      },
-    ],
-  };
-
-  const chartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
-    scales: {
-      x: { display: false },
-      y: {
-        min: 0,
-        max: 100,
-        grid: { color: 'rgba(255,255,255,0.05)' },
-        ticks: { color: '#7a7c8e', font: { family: 'monospace' } },
-      },
-    },
-  };
-
-  const handleReset = async () => {
-    if (!classCode) return;
-    if (!confirm(`Reset live session for class ${classCode}?`)) return;
+  const handleRunAction = async (student, action) => {
+    if (action === 'mark_excused') {
+      if (!confirm(`Mark ${student.name} as excused for this session?`)) return;
+    }
     try {
-      await apiFetch(`/api/session/reset?class_code=${encodeURIComponent(classCode)}`);
-      setStudents({});
-      setAlerts([]);
-      alertHistoryRef.current = [];
-      chartDataRef.current = Array(CHART_POINTS).fill(null);
-      bumpChart((n) => n + 1);
+      await runAction(student.roll_number, action);
     } catch (err) {
       alert(err.message);
     }
   };
 
-  const attnBarClass =
-    kpis.avg >= 70 ? 'bar-good' : kpis.avg >= 40 ? 'bar-warn' : 'bar-bad';
+  const toggleFullscreen = async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await monitorRef.current?.requestFullscreen();
+        setFullscreen(true);
+      } else {
+        await document.exitFullscreen();
+        setFullscreen(false);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    const onFs = () => setFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
+
+  const handleStart = async () => {
+    if (!classCode || starting) return;
+    setStarting(true);
+    try {
+      await apiFetch(`/api/session/start?class_code=${encodeURIComponent(classCode)}`, { method: 'POST' });
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const handleReset = async () => {
+    if (!classCode || resetting) return;
+    if (!confirm(`End the live session for ${classCode}? Connected students will be disconnected.`)) return;
+    setResetting(true);
+    try {
+      await apiFetch(`/api/session/end?class_code=${encodeURIComponent(classCode)}`, { method: 'POST' });
+      setStudents({});
+      setAlerts([]);
+      setClassSession(null);
+      attentionTimelinesRef.current = {};
+      sparklinesRef.current = {};
+      setSessionTimelines({});
+      setSparklines({});
+      alertHistoryRef.current = [];
+      setSessionElapsed(0);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setResetting(false);
+    }
+  };
+
+  const sessionActive = !!classSession?.start_time;
+
+  const wsLabel =
+    wsStatus === 'connected'
+      ? 'Live'
+      : wsStatus === 'connecting'
+        ? 'Connecting...'
+        : 'Disconnected';
 
   return (
-    <div className="monitor-view">
-      <section className="kpi-grid">
-        <div className="kpi-card">
-          <div className="kpi-icon">👥</div>
-          <div className="kpi-data">
-            <h3>{kpis.total}</h3>
-            <p>Active Students</p>
+    <div
+      ref={monitorRef}
+      className={`monitor-view animate-in ${fullscreen ? 'fullscreen-mode' : ''}`}
+    >
+      {/* ── Top status bar ── */}
+      <div className="monitor-top-bar-enhanced">
+        <div className="monitor-top-left">
+          <div className={`ws-status ws-${wsStatus}`}>
+            <span className="status-dot" />
+            {wsStatus === 'connected' ? <Wifi size={14} /> : <WifiOff size={14} />}
+            <span>{wsLabel}</span>
           </div>
+          {sessionActive && (
+            <div className="session-live-badge">
+              <span className="live-pulse-dot" />
+              Session Active
+            </div>
+          )}
         </div>
-        <div className={`kpi-card kpi-attention ${attnBarClass}`}>
-          <div className="kpi-icon">📈</div>
-          <div className="kpi-data">
-            <h3>{kpis.avg}%</h3>
-            <p>Class Avg Attention</p>
-          </div>
-          <div className="mini-progress">
-            <div className="mini-progress-fill" style={{ width: `${kpis.avg}%` }} />
-          </div>
+        <div className="monitor-top-right">
+          {sessionActive && (
+            <span className="session-timer-display">
+              {formatDuration(sessionElapsed)}
+            </span>
+          )}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={toggleFullscreen}>
+            <Maximize2 size={15} />
+            {fullscreen ? 'Exit' : 'Fullscreen'}
+          </button>
+          {!sessionActive ? (
+            <button
+              type="button"
+              className="btn btn-success btn-sm"
+              onClick={handleStart}
+              disabled={starting}
+            >
+              <Play size={15} />
+              {starting ? 'Starting...' : 'Start Session'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-outline-danger btn-sm"
+              onClick={handleReset}
+              disabled={resetting}
+            >
+              <StopCircle size={15} />
+              {resetting ? 'Ending...' : 'End Session'}
+            </button>
+          )}
         </div>
-        <div className="kpi-card">
-          <div className="kpi-icon">✓</div>
-          <div className="kpi-data">
-            <h3>{kpis.ratio}%</h3>
-            <p>Attentive Ratio</p>
-          </div>
-        </div>
-        <div className="kpi-card">
-          <div className="kpi-icon">⚠</div>
-          <div className="kpi-data">
-            <h3>{kpis.alerts}</h3>
-            <p>Active Alerts</p>
-          </div>
-        </div>
-      </section>
+      </div>
 
-      <div className="workspace-layout">
-        <div className="panel glass panel-main">
-          <div className="panel-header">
-            <h2>Live Student Grid</h2>
-            <input
-              type="search"
-              placeholder="Search by name, roll, or class…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="search-input"
-            />
+      {/* ── Hero KPI strip (only when session active) ── */}
+      {sessionActive && (
+        <div className="monitor-hero-kpi">
+          <div className="hero-kpi-item hero-kpi-blue">
+            <div className="hero-kpi-icon">
+              <Users size={18} />
+            </div>
+            <div className="hero-kpi-data">
+              <span className="hero-kpi-value">{kpis.total}</span>
+              <span className="hero-kpi-label">Connected</span>
+            </div>
           </div>
-          <div className="student-grid">
-            {studentList.length === 0 && (
-              <div className="empty-grid-msg">
-                <span>Waiting for students to connect…</span>
+          <div className="hero-kpi-divider" />
+          <div className="hero-kpi-item hero-kpi-green">
+            <div className="hero-kpi-icon hero-kpi-icon-green">
+              <Activity size={18} />
+            </div>
+            <div className="hero-kpi-data">
+              <span className="hero-kpi-value">{kpis.avg}%</span>
+              <span className="hero-kpi-label">Avg Attention</span>
+            </div>
+          </div>
+          <div className="hero-kpi-divider" />
+          <div className="hero-kpi-item hero-kpi-emerald">
+            <div className="hero-kpi-icon hero-kpi-icon-emerald">
+              <Brain size={18} />
+            </div>
+            <div className="hero-kpi-data">
+              <span className="hero-kpi-value">{kpis.focused}</span>
+              <span className="hero-kpi-label">Focused</span>
+            </div>
+          </div>
+          <div className="hero-kpi-divider" />
+          <div className="hero-kpi-item hero-kpi-amber">
+            <div className="hero-kpi-icon hero-kpi-icon-amber">
+              <Zap size={18} />
+            </div>
+            <div className="hero-kpi-data">
+              <span className="hero-kpi-value">{kpis.alerts}</span>
+              <span className="hero-kpi-label">Active Alerts</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Workspace ── */}
+      <div className="workspace-layout">
+        <div className="panel glass panel-main monitor-main-panel">
+          {/* ── Filter bar ── */}
+          <div className="monitor-filter-bar">
+            <div className="monitor-search-wrap">
+              <Search size={15} className="monitor-search-icon" />
+              <input
+                type="search"
+                placeholder="Search by name or roll number..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="monitor-search-input"
+              />
+            </div>
+            <div className="monitor-filter-chips">
+              {VIEW_FILTERS.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  className={`monitor-chip ${viewFilter === id ? 'active' : ''}`}
+                  onClick={() => setViewFilter(id)}
+                >
+                  <Icon size={13} />
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="monitor-sort-wrap">
+              <SortAsc size={14} className="sort-icon" />
+              <select
+                className="monitor-sort-select"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+              >
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="monitor-results-bar">
+            <span className="results-count">
+              Showing <strong>{filtered.length}</strong> of <strong>{studentList.length}</strong> students
+            </span>
+          </div>
+
+          {/* ── Student grid ── */}
+          <div className="student-grid student-grid-v2">
+            {!sessionActive && (
+              <div className="monitor-empty-state">
+                <div className="monitor-empty-icon">
+                  <Play size={36} strokeWidth={1.5} />
+                </div>
+                <h3>Session Not Started</h3>
+                <p>Click <strong>Start Session</strong> to begin monitoring students.</p>
+              </div>
+            )}
+            {sessionActive && studentList.length === 0 && (
+              <div className="monitor-empty-state">
+                <div className="monitor-empty-icon monitor-empty-pulse">
+                  <Users size={36} strokeWidth={1.5} />
+                </div>
+                <h3>Waiting for Students</h3>
+                <p>Students will appear here as they connect to the session.</p>
+              </div>
+            )}
+            {sessionActive && studentList.length > 0 && filtered.length === 0 && (
+              <div className="monitor-empty-state">
+                <div className="monitor-empty-icon">
+                  <Search size={36} strokeWidth={1.5} />
+                </div>
+                <h3>No Matches</h3>
+                <p>No students match the current filter or search.</p>
               </div>
             )}
             {filtered.map((s) => (
-              <StudentCard key={s.roll_number || s.name} student={s} />
+              <StudentCard
+                key={s.roll_number || s.name}
+                student={s}
+                highlighted={highlightRoll === s.roll_number}
+                attentionThreshold={attentionThreshold}
+                sparkline={sparklines[s.roll_number] || []}
+                actionState={getState(s.roll_number)}
+                alertFlashing={!!flashingRolls[s.roll_number]}
+                onClick={setSelectedStudent}
+                onViewHistory={onViewStudentHistory}
+                onRunAction={handleRunAction}
+              />
             ))}
           </div>
         </div>
 
+        {/* ── Alerts sidebar ── */}
         <aside className="sidebar-stack">
-          <div className="panel glass chart-panel">
+          <div className="panel alerts-panel card alerts-panel-enhanced">
             <div className="panel-header">
-              <h2>Class Trend</h2>
-            </div>
-            <div className="chart-wrap">
-              <Line data={chartConfig} options={chartOptions} />
-            </div>
-          </div>
-
-          <div className="panel glass alerts-panel">
-            <div className="panel-header">
-              <h2>Live Alerts</h2>
-              <span className="badge">{alerts.length}</span>
+              <div className="panel-title-group">
+                <AlertTriangle size={15} className="panel-title-icon panel-title-icon-warn" />
+                <h2>Alerts</h2>
+              </div>
+              {alerts.length > 0 && <span className="alerts-count-badge">{alerts.length}</span>}
             </div>
             <div className="alerts-feed">
-              {alerts.length === 0 && (
-                <p className="empty-alerts">No active alerts</p>
-              )}
-              {alerts.map((a) => (
-                <div key={a.id} className="feed-item">
-                  <div className="feed-item-info">
-                    <div className="feed-item-title">
-                      {a.name} <span className="feed-roll">({a.roll})</span>
-                    </div>
-                    <div className="feed-alert-text">{a.alert}</div>
+              {alerts.length === 0 ? (
+                <div className="alerts-empty-state">
+                  <div className="alerts-empty-icon">
+                    <Bell size={24} />
                   </div>
-                  <div className="feed-item-time">{a.time}</div>
+                  <p>No alerts yet</p>
+                  <span>Alerts will appear here when students need attention.</span>
                 </div>
-              ))}
+              ) : (
+                alerts.map((a) => (
+                  <button
+                    key={a.id}
+                    type="button"
+                    className={`feed-item feed-item-btn ${a.critical ? 'feed-critical' : ''}`}
+                    onClick={() => {
+                      scrollToStudent(a.roll);
+                      const st = students[a.roll];
+                      if (st) setSelectedStudent(st);
+                    }}
+                  >
+                    <div className="feed-item-info">
+                      <div className="feed-item-title">
+                        {a.critical && <span className="critical-dot" />}
+                        {a.name} <span className="feed-roll">({a.roll})</span>
+                      </div>
+                      <div className="feed-alert-text">{a.alert}</div>
+                    </div>
+                    <div className="feed-item-time">{a.time}</div>
+                  </button>
+                ))
+              )}
             </div>
           </div>
         </aside>
       </div>
 
-      <div className="monitor-toolbar">
-        <div className={`ws-status ws-${wsStatus}`}>
-          <span className="status-dot" />
-          {wsStatus === 'connected'
-            ? 'Live Connected'
-            : wsStatus === 'connecting'
-              ? 'Connecting…'
-              : 'Disconnected'}
-        </div>
-        <button type="button" className="btn btn-danger" onClick={handleReset}>
-          Reset Session
-        </button>
-      </div>
+      <StudentDetailModal
+        student={selectedStudent}
+        classCode={classCode}
+        attentionThreshold={attentionThreshold}
+        sessionTimeline={selectedStudent ? sessionTimelines[selectedStudent.roll_number] : []}
+        onClose={() => setSelectedStudent(null)}
+      />
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -7,10 +7,12 @@ import {
   LineElement,
   Tooltip,
 } from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
 import { Line } from 'react-chartjs-2';
 import { apiFetch } from '../api';
+import { formatDurationSec, formatTs } from '../utils/analyticsUtils';
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip);
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, zoomPlugin);
 
 export default function SessionDetail({ sessionId, onClose, onDeleted }) {
   const [session, setSession] = useState(null);
@@ -36,27 +38,40 @@ export default function SessionDetail({ sessionId, onClose, onDeleted }) {
     };
   }, [sessionId]);
 
+  const chartData = useMemo(() => {
+    const logs = session?.logs || [];
+    return {
+      labels: logs.map((l) =>
+        new Date((l.timestamp || 0) * 1000).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+      ),
+      datasets: [
+        {
+          label: 'Attention %',
+          data: logs.map((l) => l.attention),
+          borderColor: '#5aa0f0',
+          backgroundColor: 'rgba(90, 160, 240, 0.15)',
+          tension: 0.25,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+          fill: true,
+        },
+      ],
+    };
+  }, [session]);
+
   if (!sessionId) return null;
 
   const logs = session?.logs || [];
-  const chartData = {
-    labels: logs.map((_, i) => i + 1),
-    datasets: [
-      {
-        label: 'Attention %',
-        data: logs.map((l) => l.attention),
-        borderColor: '#5aa0f0',
-        tension: 0.25,
-        pointRadius: 0,
-      },
-    ],
-  };
 
   return (
     <div className="modal-overlay" onClick={onClose} role="presentation">
-      <div className="modal glass" onClick={(e) => e.stopPropagation()}>
+      <div className="modal glass session-detail-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h2>Session detail</h2>
+          <h2>Session Analytics</h2>
           <div className="header-actions">
             {session && (
               <button
@@ -73,7 +88,7 @@ export default function SessionDetail({ sessionId, onClose, onDeleted }) {
                   }
                 }}
               >
-                Delete session
+                Delete
               </button>
             )}
             <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>
@@ -82,7 +97,12 @@ export default function SessionDetail({ sessionId, onClose, onDeleted }) {
           </div>
         </div>
 
-        {loading && <p className="muted">Loading…</p>}
+        {loading && (
+          <div className="page-loading">
+            <div className="spinner" />
+            <p>Loading session details…</p>
+          </div>
+        )}
         {error && <p className="auth-error">{error}</p>}
 
         {session && (
@@ -92,11 +112,17 @@ export default function SessionDetail({ sessionId, onClose, onDeleted }) {
                 <strong>{session.name}</strong> · Roll {session.roll_number} · {session.class_code}
               </p>
               <p className="muted">
-                Avg {session.avg_attention}% · {session.alerts_count} alerts · {session.log_count}{' '}
-                samples
+                Avg {session.avg_attention}% · {session.alerts_count} alerts ·{' '}
+                {formatDurationSec(session.duration_sec)}
+              </p>
+              <p className="muted mono-sm">
+                Join {formatTs(session.join_time || session.start_time)} · Leave{' '}
+                {formatTs(session.leave_time || session.end_time)}
               </p>
             </div>
-            <div className="history-chart-wrap">
+
+            <p className="chart-hint muted">Scroll to zoom · Drag to pan · Hover for values</p>
+            <div className="history-chart-wrap session-timeline-chart">
               {logs.length === 0 ? (
                 <p className="muted">No log samples in this session.</p>
               ) : (
@@ -105,10 +131,32 @@ export default function SessionDetail({ sessionId, onClose, onDeleted }) {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                      legend: { display: false },
+                      tooltip: {
+                        callbacks: {
+                          label: (ctx) => `Attention: ${ctx.parsed.y}%`,
+                        },
+                      },
+                      zoom: {
+                        pan: { enabled: true, mode: 'x' },
+                        zoom: {
+                          wheel: { enabled: true },
+                          pinch: { enabled: true },
+                          mode: 'x',
+                        },
+                      },
+                    },
                     scales: {
-                      y: { min: 0, max: 100, ticks: { color: '#7a7c8e' } },
-                      x: { ticks: { color: '#7a7c8e' } },
+                      x: {
+                        ticks: { color: '#7a7c8e', maxTicksLimit: 10 },
+                      },
+                      y: {
+                        min: 0,
+                        max: 100,
+                        ticks: { color: '#7a7c8e' },
+                      },
                     },
                   }}
                 />
