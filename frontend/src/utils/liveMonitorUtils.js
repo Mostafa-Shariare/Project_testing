@@ -16,6 +16,36 @@ export function isCriticalAlert(alert) {
   );
 }
 
+export function getAlertSeverity(durationSec = 0, attentionScore = 50) {
+  if (durationSec > 60 || attentionScore < 30) {
+    return { level: 'Extended Drift', badgeClass: 'severity-extended', color: '#DC2626', bg: '#FEE2E2' };
+  }
+  if (durationSec > 25 || attentionScore < 45) {
+    return { level: 'Moderate Shift', badgeClass: 'severity-moderate', color: '#EA580C', bg: '#FFEDD5' };
+  }
+  return { level: 'Notice', badgeClass: 'severity-notice', color: '#D97706', bg: '#FEF3C7' };
+}
+
+export function formatEvidenceMessage(student) {
+  const alertText = normalizeAlert(student.alert || '');
+  const durSec = Math.round(student.sustained_duration_sec || (student.seconds_since_last_alert ?? 15));
+  const timeStr = durSec > 0 ? `${durSec} seconds` : 'a brief interval';
+
+  if (alertText.includes('PHONE') || student.phone_detected) {
+    return `Mobile device presence observed for ${timeStr}.`;
+  }
+  if (alertText.includes('NO FACE')) {
+    return `Face detection unmaintained for ${timeStr}.`;
+  }
+  if (alertText.includes('EYES CLOSED')) {
+    return `Eyes closed indicator active for ${timeStr}.`;
+  }
+  if (alertText.includes('HIGH BLINK')) {
+    return `Elevated blink frequency observed for ${timeStr}.`;
+  }
+  return `Sustained attention drift detected for ${timeStr}.`;
+}
+
 export function matchesAlertFilter(student, filterId) {
   const alert = normalizeAlert(student.alert);
   switch (filterId) {
@@ -31,12 +61,12 @@ export function matchesAlertFilter(student, filterId) {
 }
 
 export function isBelowThreshold(student, threshold = 50) {
-  if (student.status !== 'active') return false;
+  if (!student || student.status !== 'active') return false;
   return (student.attention ?? 0) < threshold;
 }
 
 export function attentionLevel(student, threshold = 50) {
-  if (student.status === 'offline') return 'offline';
+  if (!student || student.status === 'offline') return 'offline';
   const score = student.attention ?? 0;
   if (score < threshold) return 'distracted';
   if (score < 70) return 'moderate';
@@ -44,6 +74,7 @@ export function attentionLevel(student, threshold = 50) {
 }
 
 export function matchesStatusFilter(student, filterId, threshold = 50) {
+  if (!student) return false;
   switch (filterId) {
     case 'active':
       return student.status === 'active';

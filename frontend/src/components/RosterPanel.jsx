@@ -1,10 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
-import { UserPlus, Upload, Trash2, Users, Search, BookOpen } from 'lucide-react';
+import {
+  UserPlus,
+  Upload,
+  Trash2,
+  Users,
+  Search,
+  GraduationCap,
+  CheckCircle2,
+  AlertCircle,
+  FileSpreadsheet,
+} from 'lucide-react';
 import { apiFetch, getToken } from '../api';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-export default function RosterPanel({ classCode }) {
+export default function RosterPanel({ classCode = 'CS233' }) {
   const [roster, setRoster] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -19,9 +29,9 @@ export default function RosterPanel({ classCode }) {
     setError('');
     try {
       const data = await apiFetch(`/api/classes/${encodeURIComponent(classCode)}/roster`);
-      setRoster(data);
+      setRoster(data || []);
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Failed to load roster');
     } finally {
       setLoading(false);
     }
@@ -33,29 +43,36 @@ export default function RosterPanel({ classCode }) {
 
   const handleAdd = async (e) => {
     e.preventDefault();
+    if (!roll.trim() || !name.trim()) return;
     try {
       await apiFetch(`/api/classes/${encodeURIComponent(classCode)}/roster`, {
         method: 'POST',
-        body: JSON.stringify({ roll_number: roll, name }),
+        body: JSON.stringify({ roll_number: roll.trim(), name: name.trim() }),
       });
       setRoll('');
       setName('');
+      setImportMsg(`Added student ${name.trim()} (${roll.trim()})`);
+      setTimeout(() => setImportMsg(''), 3000);
       load();
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Failed to add student');
+      setTimeout(() => setError(''), 4000);
     }
   };
 
-  const handleDelete = async (rollNumber) => {
-    if (!confirm(`Remove ${rollNumber} from roster?`)) return;
+  const handleDelete = async (rollNumber, studentName) => {
+    if (!confirm(`Remove ${studentName || rollNumber} from ${classCode} roster?`)) return;
     try {
       await apiFetch(
         `/api/classes/${encodeURIComponent(classCode)}/roster/${encodeURIComponent(rollNumber)}`,
         { method: 'DELETE' },
       );
+      setImportMsg(`Removed student ${rollNumber}`);
+      setTimeout(() => setImportMsg(''), 3000);
       load();
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Failed to delete student');
+      setTimeout(() => setError(''), 4000);
     }
   };
 
@@ -63,6 +80,7 @@ export default function RosterPanel({ classCode }) {
     const file = e.target.files?.[0];
     if (!file) return;
     setImportMsg('');
+    setError('');
     const form = new FormData();
     form.append('file', file);
     const token = getToken();
@@ -77,157 +95,227 @@ export default function RosterPanel({ classCode }) {
       );
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Import failed');
-      setImportMsg(`Imported ${data.imported} students from ${data.filename}`);
+      setImportMsg(`Imported ${data.imported || 0} students from ${data.filename || file.name}`);
+      setTimeout(() => setImportMsg(''), 4000);
       load();
     } catch (err) {
-      setError(err.message);
+      setError(err.message || 'Failed to import CSV');
+      setTimeout(() => setError(''), 4000);
     }
     e.target.value = '';
   };
 
   const filtered = roster.filter(
     (s) =>
-      s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.roll_number.toLowerCase().includes(searchQuery.toLowerCase()),
+      (s.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (s.roll_number || '').toLowerCase().includes(searchQuery.toLowerCase()),
   );
 
-  if (!classCode) {
-    return (
-      <div className="empty-class-prompt glass">
-        <p>Select a class to manage its roster.</p>
-      </div>
-    );
-  }
-
   return (
-    <div className="roster-view animate-in">
-      <div className="page-header-section">
-        <div className="page-header-text">
-          <h1 className="page-heading">Class Roster</h1>
-          <p className="page-heading-sub">Manage students for <strong>{classCode}</strong></p>
+    <div className="telemetry-roster-wrapper">
+      {/* Notifications */}
+      {importMsg && (
+        <div style={{
+          background: 'rgba(78, 222, 163, 0.12)',
+          border: '1px solid rgba(78, 222, 163, 0.3)',
+          borderRadius: 6,
+          color: '#4edea3',
+          padding: '0.6rem 1rem',
+          fontSize: '0.8125rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+        }}>
+          <CheckCircle2 size={16} />
+          <span>{importMsg}</span>
         </div>
-        <div className="page-header-badge">
-          <Users size={16} />
-          <span>{roster.length} students</span>
+      )}
+
+      {error && (
+        <div style={{
+          background: 'rgba(239, 68, 68, 0.12)',
+          border: '1px solid rgba(239, 68, 68, 0.3)',
+          borderRadius: 6,
+          color: '#ffb4ab',
+          padding: '0.6rem 1rem',
+          fontSize: '0.8125rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+        }}>
+          <AlertCircle size={16} />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* Header Bar */}
+      <div className="telemetry-roster-header">
+        <div className="telemetry-roster-title-row">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <h1 className="telemetry-roster-title">Class Roster</h1>
+            <span className="telemetry-roster-badge">{classCode}</span>
+          </div>
+          <p className="telemetry-roster-subtitle">
+            Manage enrolled students, assign identifiers, and import classroom datasets for course <strong>{classCode}</strong>.
+          </p>
+        </div>
+
+        <div className="telemetry-roster-count-pill">
+          <Users size={15} />
+          <span>{roster.length} {roster.length === 1 ? 'Student' : 'Students'} Enrolled</span>
         </div>
       </div>
 
-      <div className="roster-layout">
-        <div className="panel glass roster-form-panel">
-          <div className="panel-header">
-            <div className="panel-title-group">
-              <UserPlus size={16} className="panel-title-icon" />
-              <h2>Add Student</h2>
-            </div>
+      {/* 2-Column Grid Layout */}
+      <div className="telemetry-roster-grid">
+        {/* Left Column (5 cols): Add Student & Bulk Import */}
+        <div className="telemetry-roster-card">
+          <div className="telemetry-roster-card-header">
+            <h2 className="telemetry-roster-card-title">
+              <UserPlus size={18} style={{ color: '#d0bcff' }} />
+              <span>Add Student</span>
+            </h2>
+            <span style={{ fontFamily: 'JetBrains Mono', fontSize: '0.6875rem', color: '#9ca3af' }}>
+              Manual Entry
+            </span>
           </div>
 
-          <form className="roster-add-form-enhanced" onSubmit={handleAdd}>
-            <div className="form-field-group">
-              <label className="form-field-label">Roll Number</label>
+          <form className="telemetry-roster-form" onSubmit={handleAdd}>
+            <div className="telemetry-roster-field">
+              <label className="telemetry-roster-label">Roll Number / ID</label>
               <input
-                placeholder="e.g. CS-001"
+                placeholder="e.g. CS-001 or 12345"
                 value={roll}
                 onChange={(e) => setRoll(e.target.value)}
                 required
-                className="form-input"
+                className="telemetry-roster-input"
+                style={{ fontFamily: 'JetBrains Mono' }}
               />
             </div>
-            <div className="form-field-group">
-              <label className="form-field-label">Full Name</label>
+
+            <div className="telemetry-roster-field">
+              <label className="telemetry-roster-label">Full Name</label>
               <input
                 placeholder="e.g. Jane Smith"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 required
-                className="form-input"
+                className="telemetry-roster-input"
               />
             </div>
-            <button type="submit" className="btn btn-primary btn-sm add-student-btn">
-              <UserPlus size={15} />
-              Add Student
+
+            <button type="submit" className="telemetry-roster-btn-add">
+              <UserPlus size={16} />
+              <span>Add Student to Class</span>
             </button>
           </form>
 
-          <div className="roster-divider" />
+          <div className="telemetry-roster-divider" />
 
-          <div className="csv-import-section">
-            <label className="btn btn-ghost btn-sm csv-upload-btn">
-              <Upload size={15} />
-              Import from CSV
+          {/* CSV Upload Dropzone */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <span className="telemetry-roster-label">Bulk Import via CSV:</span>
+            <label className="telemetry-roster-csv-box">
+              <FileSpreadsheet size={24} style={{ color: '#d0bcff' }} />
+              <div>
+                <span style={{ color: '#f9fafb', fontWeight: 600, fontSize: '0.85rem' }}>
+                  Click to select CSV file
+                </span>
+              </div>
+              <span style={{ color: '#9ca3af', fontSize: '0.72rem', fontFamily: 'JetBrains Mono' }}>
+                Required headers: roll_number, name
+              </span>
               <input type="file" accept=".csv,text/csv" onChange={handleCsv} hidden />
             </label>
-            <span className="muted csv-hint">Required columns: roll_number, name</span>
           </div>
-          {importMsg && <p className="import-success-msg">{importMsg}</p>}
-          {error && <p className="auth-error">{error}</p>}
         </div>
 
-        <div className="panel glass roster-table-panel">
-          <div className="panel-header">
-            <div className="panel-title-group">
-              <BookOpen size={16} className="panel-title-icon" />
-              <h2>Student List</h2>
-            </div>
+        {/* Right Column (7 cols): Enrolled Student Directory */}
+        <div className="telemetry-roster-card">
+          <div className="telemetry-roster-card-header">
+            <h2 className="telemetry-roster-card-title">
+              <GraduationCap size={18} style={{ color: '#4edea3' }} />
+              <span>Student Directory</span>
+            </h2>
+
             {roster.length > 0 && (
-              <div className="roster-search-wrap">
-                <Search size={14} className="search-icon" />
+              <div className="telemetry-roster-search-box">
+                <Search size={14} className="telemetry-roster-search-icon" />
                 <input
                   type="text"
-                  placeholder="Search students..."
+                  placeholder="Search by name or roll..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  className="roster-search-input"
+                  className="telemetry-roster-search-input"
                 />
               </div>
             )}
           </div>
 
           {loading ? (
-            <div className="roster-empty-state">
-              <div className="spinner" />
-              <p>Loading roster...</p>
+            <div style={{ padding: '3rem', textAlign: 'center', color: '#9ca3af', fontSize: '0.85rem' }}>
+              Loading classroom roster...
             </div>
           ) : roster.length === 0 ? (
-            <div className="roster-empty-state">
-              <div className="roster-empty-icon">
-                <Users size={40} strokeWidth={1.5} />
+            <div style={{
+              padding: '3.5rem 1.5rem',
+              textAlign: 'center',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '0.75rem',
+              color: '#9ca3af',
+            }}>
+              <Users size={40} strokeWidth={1.5} style={{ opacity: 0.4 }} />
+              <div>
+                <h3 style={{ fontSize: '1rem', fontWeight: 600, color: '#f9fafb', margin: '0 0 0.25rem 0' }}>
+                  No students in roster yet
+                </h3>
+                <p style={{ fontSize: '0.8125rem', margin: 0, maxWidth: 320 }}>
+                  Add students using the form on the left or upload a roster CSV file.
+                </p>
               </div>
-              <h3>No students yet</h3>
-              <p>Add students manually or import a CSV file to get started.</p>
             </div>
           ) : filtered.length === 0 ? (
-            <div className="roster-empty-state">
-              <Search size={32} />
-              <p>No students match "{searchQuery}"</p>
+            <div style={{ padding: '3rem', textAlign: 'center', color: '#9ca3af', fontSize: '0.85rem' }}>
+              No students match "{searchQuery}"
             </div>
           ) : (
-            <table className="history-table roster-table enhanced-table">
-              <thead>
-                <tr>
-                  <th className="col-roll">Roll</th>
-                  <th className="col-name">Name</th>
-                  <th className="col-action" />
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((s, i) => (
-                  <tr key={s.roll_number} style={{ animationDelay: `${i * 25}ms` }}>
-                    <td className="mono">{s.roll_number}</td>
-                    <td className="student-name-cell">{s.name}</td>
-                    <td>
-                      <button
-                        type="button"
-                        className="btn-icon-danger"
-                        onClick={() => handleDelete(s.roll_number)}
-                        title={`Remove ${s.name}`}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </td>
+            <div className="telemetry-roster-table-wrap">
+              <table className="telemetry-roster-table">
+                <thead>
+                  <tr>
+                    <th>Roll Number</th>
+                    <th>Student Name</th>
+                    <th>Status</th>
+                    <th style={{ textAlign: 'right' }}>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {filtered.map((s) => (
+                    <tr key={s.roll_number}>
+                      <td className="telemetry-roster-roll">{s.roll_number}</td>
+                      <td className="telemetry-roster-name">{s.name}</td>
+                      <td>
+                        <span className="telemetry-roster-status-enrolled">
+                          ENROLLED
+                        </span>
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <button
+                          type="button"
+                          className="telemetry-roster-btn-del"
+                          onClick={() => handleDelete(s.roll_number, s.name)}
+                          title={`Remove ${s.name} from class`}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>

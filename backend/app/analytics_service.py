@@ -21,17 +21,14 @@ from backend.app.config import ROOT_DIR, get_settings
 
 settings = get_settings()
 
-LATE_THRESHOLD_SEC = 300
-LEFT_EARLY_RATIO = 0.5
-
 ALERT_TYPES = {
     "phone": ("PHONE",),
     "no_face": ("NO FACE",),
     "eyes_closed": ("EYES CLOSED",),
 }
 
-INSTITUTION_NAME = "Attention Monitor"
-INSTITUTION_SUBTITLE = "Classroom Analytics Report"
+INSTITUTION_NAME = "Attenova Attention Monitor"
+INSTITUTION_SUBTITLE = "Attention Analytics & Session Report"
 
 # Characters that trigger Excel formula injection — prefix with apostrophe to neutralize
 _FORBIDDEN_NAME_PREFIXES = ("=", "+", "-", "@", "\t", "\n", "\r")
@@ -87,12 +84,12 @@ def summarize_session(doc: dict) -> dict:
         "teacher_username": doc.get("teacher_username"),
         "start_time": doc["start_time"],
         "end_time": doc["end_time"],
-        "status": doc["status"],
+        "status": doc.get("status", "completed"),
         "avg_attention": avg_attention,
         "alerts_count": alerts_count,
         "log_count": len(logs),
         "duration_sec": duration,
-        "attendance_status": doc.get("attendance_status", "present"),
+        "session_status": doc.get("status", "completed"),
         "join_time": doc.get("join_time", doc.get("start_time")),
         "leave_time": doc.get("leave_time", doc.get("end_time")),
     }
@@ -115,27 +112,6 @@ def alert_breakdown(logs: list) -> dict:
         if kind:
             counts[kind] += 1
     return counts
-
-
-def compute_attendance_status(join_time: float, class_session_start: Optional[float]) -> str:
-    if not class_session_start:
-        return "present"
-    if join_time - class_session_start > LATE_THRESHOLD_SEC:
-        return "late"
-    return "present"
-
-
-def finalize_attendance_on_leave(
-    session: dict, end_time: float, class_session_start: Optional[float]
-) -> str:
-    status = session.get("attendance_status", "present")
-    start = session.get("start_time", end_time)
-    participated = max(0, end_time - start)
-    if class_session_start and participated < LEFT_EARLY_RATIO * max(
-        1, end_time - class_session_start
-    ):
-        return "left_early"
-    return status
 
 
 def fetch_sessions(
@@ -218,22 +194,22 @@ def compare_sessions(doc_a: dict, doc_b: dict, roster_size: int) -> dict:
     sa = summarize_session(doc_a)
     sb = summarize_session(doc_b)
 
-    def _attendance_metrics(s: dict) -> dict:
+    def _session_metrics(s: dict) -> dict:
         return {
             "duration_sec": s["duration_sec"],
-            "attendance_status": s["attendance_status"],
+            "session_status": s.get("session_status", "completed"),
             "participation_minutes": round(s["duration_sec"] / 60, 1),
         }
 
     return {
         "session_a": {
             **sa,
-            "attendance": _attendance_metrics(sa),
+            "session_metrics": _session_metrics(sa),
             "alert_breakdown": alert_breakdown(doc_a.get("logs", [])),
         },
         "session_b": {
             **sb,
-            "attendance": _attendance_metrics(sb),
+            "session_metrics": _session_metrics(sb),
             "alert_breakdown": alert_breakdown(doc_b.get("logs", [])),
         },
         "delta": {
@@ -273,8 +249,8 @@ def build_student_analytics(
             breakdown[k] += v
 
     participation_sec = sum(s["duration_sec"] for s in summaries)
-    present_count = sum(1 for s in summaries if s["attendance_status"] in ("present", "late"))
-    attendance_pct = round(100 * present_count / max(1, len(summaries)))
+    high_focus_count = sum(1 for s in summaries if s["avg_attention"] >= 70)
+    high_focus_pct = round(100 * high_focus_count / max(1, len(summaries)))
 
     # Rank within class by average attention across all sessions
     by_roll: dict[str, list[int]] = defaultdict(list)
@@ -295,7 +271,8 @@ def build_student_analytics(
         "lowest_attention": min(attentions),
         "total_alerts": alerts_total,
         "alert_breakdown": breakdown,
-        "attendance_percentage": attendance_pct,
+        "high_focus_percentage": high_focus_pct,
+        "attendance_percentage": high_focus_pct,  # Backwards compatibility alias
         "participation_sec": participation_sec,
         "participation_hours": round(participation_sec / 3600, 2),
         "class_rank": rank,
@@ -305,14 +282,15 @@ def build_student_analytics(
     }
 
 
-def build_attendance_analytics(
+def build_attention_session_analytics(
     sessions: list[dict],
-    roster: list[dict],
-    from_ts: float,
-    to_ts: float,
+    roster: Optional[list[dict]] = None,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
 ) -> dict:
     summaries = [summarize_session(s) for s in sessions]
-    roster_rolls = {r["roll_number"] for r in roster}
+    roster_list = roster if roster is not None else [{"roll_number": s["roll_number"]} for s in summaries]
+    roster_rolls = {r["roll_number"] for r in roster_list}
     roster_size = len(roster_rolls) or 1
 
     by_student: dict[str, dict] = {}
@@ -322,65 +300,66 @@ def build_attendance_analytics(
             by_student[roll] = {
                 "roll_number": roll,
                 "name": s["name"],
-                "present": 0,
-                "late": 0,
-                "left_early": 0,
+                "high_focus": 0,
+                "moderate_drift": 0,
+                "low_focus": 0,
                 "sessions": 0,
                 "total_duration_sec": 0,
+                "attention_scores": [],
             }
         rec = by_student[roll]
         rec["sessions"] += 1
         rec["total_duration_sec"] += s["duration_sec"]
-        st = s.get("attendance_status", "present")
-        if st == "late":
-            rec["late"] += 1
-        elif st == "left_early":
-            rec["left_early"] += 1
+        score = s["avg_attention"]
+        rec["attention_scores"].append(score)
+        if score >= 70:
+            rec["high_focus"] += 1
+        elif score >= 45:
+            rec["moderate_drift"] += 1
         else:
-            rec["present"] += 1
+            rec["low_focus"] += 1
 
-    weekly: dict[str, dict] = defaultdict(lambda: {"present": 0, "late": 0, "absent": 0})
-    monthly: dict[str, dict] = defaultdict(lambda: {"present": 0, "late": 0, "absent": 0})
+    weekly: dict[str, dict] = defaultdict(lambda: {"high_focus": 0, "moderate_drift": 0, "low_focus": 0})
+    monthly: dict[str, dict] = defaultdict(lambda: {"high_focus": 0, "moderate_drift": 0, "low_focus": 0})
 
-    days_present: dict[str, set] = defaultdict(set)
     for s in summaries:
-        day = _day_key(s["start_time"])
-        days_present[day].add(s["roll_number"])
         wk = _week_key(s["start_time"])
         mo = _month_key(s["start_time"])
-        st = s.get("attendance_status", "present")
-        if st == "late":
-            weekly[wk]["late"] += 1
-            monthly[mo]["late"] += 1
+        score = s["avg_attention"]
+        if score >= 70:
+            weekly[wk]["high_focus"] += 1
+            monthly[mo]["high_focus"] += 1
+        elif score >= 45:
+            weekly[wk]["moderate_drift"] += 1
+            monthly[mo]["moderate_drift"] += 1
         else:
-            weekly[wk]["present"] += 1
-            monthly[mo]["present"] += 1
-
-    for day, rolls in days_present.items():
-        absent = max(0, roster_size - len(rolls))
-        wk = _week_key(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
-        mo = _month_key(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
-        weekly[wk]["absent"] += absent
-        monthly[mo]["absent"] += absent
+            weekly[wk]["low_focus"] += 1
+            monthly[mo]["low_focus"] += 1
 
     leaderboard = sorted(
         [
             {
-                **v,
-                "attendance_rate": round(
-                    100 * (v["present"] + v["late"]) / max(1, v["sessions"]), 1
-                ),
+                "roll_number": v["roll_number"],
+                "name": v["name"],
+                "high_focus": v["high_focus"],
+                "moderate_drift": v["moderate_drift"],
+                "low_focus": v["low_focus"],
+                "sessions": v["sessions"],
+                "total_duration_sec": v["total_duration_sec"],
+                "avg_attention": round(sum(v["attention_scores"]) / max(1, len(v["attention_scores"]))),
+                "high_focus_rate": round(100 * v["high_focus"] / max(1, v["sessions"]), 1),
+                "attendance_rate": round(100 * v["high_focus"] / max(1, v["sessions"]), 1),  # Backwards compat alias
             }
             for v in by_student.values()
         ],
-        key=lambda x: x["attendance_rate"],
+        key=lambda x: x["avg_attention"],
         reverse=True,
     )
 
     total_sessions = len(summaries)
-    present_total = sum(1 for s in summaries if s.get("attendance_status") == "present")
-    late_total = sum(1 for s in summaries if s.get("attendance_status") == "late")
-    left_early_total = sum(1 for s in summaries if s.get("attendance_status") == "left_early")
+    high_focus_total = sum(1 for s in summaries if s["avg_attention"] >= 70)
+    moderate_drift_total = sum(1 for s in summaries if 45 <= s["avg_attention"] < 70)
+    low_focus_total = sum(1 for s in summaries if s["avg_attention"] < 45)
 
     return {
         "from_time": from_ts,
@@ -388,16 +367,21 @@ def build_attendance_analytics(
         "roster_size": roster_size,
         "summary": {
             "total_session_records": total_sessions,
-            "present": present_total,
-            "late": late_total,
-            "left_early": left_early_total,
-            "attendance_rate": round(100 * (present_total + late_total) / max(1, total_sessions), 1),
+            "high_focus_sessions": high_focus_total,
+            "moderate_drift_sessions": moderate_drift_total,
+            "low_focus_sessions": low_focus_total,
+            "high_focus_rate": round(100 * high_focus_total / max(1, total_sessions), 1),
+            "attendance_rate": round(100 * high_focus_total / max(1, total_sessions), 1),  # Backwards compat alias
         },
         "weekly": [{"period": k, **v} for k, v in sorted(weekly.items())],
         "monthly": [{"period": k, **v} for k, v in sorted(monthly.items())],
         "students": leaderboard,
         "records": summaries,
     }
+
+
+# Backwards compatibility alias
+build_attendance_analytics = build_attention_session_analytics
 
 
 def generate_excel_workbook(
@@ -424,7 +408,7 @@ def generate_excel_workbook(
         "Duration (min)",
         "Avg Attention",
         "Alerts",
-        "Attendance",
+        "Status",
     ]
     ws.append(headers)
     for row in overview.get("ranked_sessions", []):
@@ -437,23 +421,23 @@ def generate_excel_workbook(
                 round(row["duration_sec"] / 60, 1),
                 row["avg_attention"],
                 row["alerts_count"],
-                row.get("attendance_status", ""),
+                row.get("status", "completed"),
             ]
         )
 
     # Student Performance
     ws2 = wb.create_sheet("Student Performance")
-    ws2.append(["Roll", "Name", "Sessions", "Avg Attention", "Rank", "Alerts", "Attendance %"])
+    ws2.append(["Roll", "Name", "Sessions", "Avg Attention %", "Rank", "Alerts", "High Focus %"])
     for st in student_analytics:
         ws2.append(
             [
                 st["roll_number"],
                 _sanitize_export_name(st.get("name", "")),
-                st["session_count"],
-                st["avg_attention"],
+                st.get("session_count", st.get("sessions", 0)),
+                st.get("avg_attention", 0),
                 st.get("class_rank"),
-                st["total_alerts"],
-                st["attendance_percentage"],
+                st.get("total_alerts", 0),
+                st.get("high_focus_percentage", st.get("high_focus_rate", st.get("attendance_percentage", 0))),
             ]
         )
 
@@ -473,19 +457,19 @@ def generate_excel_workbook(
             ]
         )
 
-    # Attendance
-    ws4 = wb.create_sheet("Attendance")
-    ws4.append(["Roll", "Name", "Present", "Late", "Left Early", "Sessions", "Rate %"])
+    # Attention Breakdown
+    ws4 = wb.create_sheet("Attention Breakdown")
+    ws4.append(["Roll", "Name", "High Focus", "Moderate Drift", "Low Focus", "Sessions", "High Focus %"])
     for st in attendance.get("students", []):
         ws4.append(
             [
                 st["roll_number"],
                 _sanitize_export_name(st.get("name", "")),
-                st["present"],
-                st["late"],
-                st["left_early"],
-                st["sessions"],
-                st["attendance_rate"],
+                st.get("high_focus", 0),
+                st.get("moderate_drift", 0),
+                st.get("low_focus", 0),
+                st.get("sessions", 0),
+                st.get("high_focus_rate", 0),
             ]
         )
 
@@ -527,14 +511,14 @@ def generate_pdf_report(
     y -= 28
 
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(inch, y, "Summary")
+    c.drawString(inch, y, "Attention Summary")
     y -= 16
     c.setFont("Helvetica", 10)
     lines = [
         f"Sessions analyzed: {overview.get('session_count', 0)}",
         f"Class average attention: {overview.get('avg_attention', 0)}%",
         f"Total alerts: {overview.get('total_alerts', 0)}",
-        f"Attendance rate: {attendance.get('summary', {}).get('attendance_rate', 0)}%",
+        f"High focus session rate: {attendance.get('summary', {}).get('high_focus_rate', 0)}%",
     ]
     for line in lines:
         c.drawString(inch, y, line)
@@ -551,7 +535,7 @@ def generate_pdf_report(
             f"Highest: {student_row.get('highest_attention')}%  Lowest: {student_row.get('lowest_attention')}%",
             f"Total alerts: {student_row.get('total_alerts')}",
             f"Class rank: {student_row.get('class_rank')} / {student_row.get('class_rank_total')}",
-            f"Attendance: {student_row.get('attendance_percentage')}%",
+            f"High focus rate: {student_row.get('high_focus_percentage', student_row.get('attendance_percentage', 0))}%",
         ]:
             c.drawString(inch, y, line)
             y -= 14
@@ -582,24 +566,28 @@ def generate_pdf_report(
     return buf.getvalue()
 
 
-def attendance_csv_rows(attendance: dict) -> str:
+def attention_session_csv_rows(attendance: dict) -> str:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([INSTITUTION_NAME, INSTITUTION_SUBTITLE])
-    writer.writerow(["Roll", "Name", "Present", "Late", "Left Early", "Sessions", "Rate %"])
+    writer.writerow(["Roll", "Name", "High Focus", "Moderate Drift", "Low Focus", "Sessions", "High Focus Rate %"])
     for st in attendance.get("students", []):
         writer.writerow(
             [
                 st["roll_number"],
                 _sanitize_export_name(st.get("name", "")),
-                st["present"],
-                st["late"],
-                st["left_early"],
-                st["sessions"],
-                st["attendance_rate"],
+                st.get("high_focus", 0),
+                st.get("moderate_drift", 0),
+                st.get("low_focus", 0),
+                st.get("sessions", 0),
+                st.get("high_focus_rate", 0),
             ]
         )
     return output.getvalue()
+
+
+# Backwards compatibility alias
+attendance_csv_rows = attention_session_csv_rows
 
 
 def _fmt_ts(ts: Optional[float]) -> str:

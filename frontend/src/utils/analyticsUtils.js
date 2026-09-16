@@ -41,16 +41,22 @@ export function buildQuery(params) {
   return q.toString();
 }
 
-export const ATTENDANCE_LABELS = {
-  present: 'Present',
-  late: 'Late',
-  absent: 'Absent',
-  left_early: 'Left Early',
+export const FOCUS_BAND_LABELS = {
+  high_focus: 'High Focus (≥70%)',
+  moderate_drift: 'Moderate Drift (45-69%)',
+  low_focus: 'Low Focus (<45%)',
+  active: 'Active Session',
+  offline: 'Completed',
 };
 
-export const ATTENDANCE_CLASS = {
-  present: 'att-present',
-  late: 'att-late',
-  absent: 'att-absent',
-  left_early: 'att-left-early',
+export const FOCUS_BAND_CLASS = {
+  high_focus: 'pill-good',
+  moderate_drift: 'pill-warn',
+  low_focus: 'pill-bad',
+  active: 'pill-active',
+  offline: 'pill-off',
 };
+
+// Backwards compatibility aliases
+export const ATTENDANCE_LABELS = FOCUS_BAND_LABELS;
+export const ATTENDANCE_CLASS = FOCUS_BAND_CLASS;

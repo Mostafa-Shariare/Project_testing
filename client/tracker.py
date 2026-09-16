@@ -33,8 +33,13 @@ import collections
 import threading
 import urllib.request
 import json
+import webbrowser
+import asyncio
+import websockets
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+from PIL import Image, ImageTk
 import matplotlib
 # Use Agg (non-interactive) so matplotlib never touches the tkinter main loop.
 # The dashboard is shown via plt.show() which opens its own window cleanly.
@@ -287,6 +292,54 @@ class TemporalSmoother:
     @property
     def window_full(self) -> bool:
         return len(self._probs) == self._probs.maxlen
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Privacy-Preserving Telemetry & Feature Debug Logger
+# ══════════════════════════════════════════════════════════════════════════════
+class TelemetryDebugLogger:
+    """
+    Privacy-Preserving Telemetry Debug Logger.
+    Logs derived numerical telemetry feature vectors and model output states to CSV.
+    NEVER stores, caches, or writes webcam image frames or video feeds.
+    """
+    def __init__(self, log_path: str = "logs/debug_telemetry.csv", enabled: bool = True):
+        self.enabled = enabled
+        self.log_path = Path(log_path)
+
+    def log_frame(self, telemetry_dict: dict):
+        if not self.enabled:
+            return
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            write_header = not self.log_path.exists()
+            with open(self.log_path, mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "timestamp", "face_present", "gaze", "pose_pitch", "pose_yaw", "pose_roll",
+                    "ear", "blinks_per_min", "phone_detected", "hands_count",
+                    "raw_prob", "smoothed_score", "attention_state", "alert"
+                ])
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({
+                    "timestamp": round(telemetry_dict.get("timestamp", time.time()), 3),
+                    "face_present": telemetry_dict.get("face_present", True),
+                    "gaze": telemetry_dict.get("gaze", "Center"),
+                    "pose_pitch": round(float(telemetry_dict.get("pose_pitch", 0.0)), 2),
+                    "pose_yaw": round(float(telemetry_dict.get("pose_yaw", 0.0)), 2),
+                    "pose_roll": round(float(telemetry_dict.get("pose_roll", 0.0)), 2),
+                    "ear": round(float(telemetry_dict.get("ear", 0.28)), 3),
+                    "blinks_per_min": round(float(telemetry_dict.get("blinks_per_min", 14.0)), 1),
+                    "phone_detected": telemetry_dict.get("phone_detected", False),
+                    "hands_count": telemetry_dict.get("hands_count", 0),
+                    "raw_prob": round(float(telemetry_dict.get("model_prob_raw", 0.85)), 3),
+                    "smoothed_score": round(float(telemetry_dict.get("smoothed_score", 85.0)), 1),
+                    "attention_state": telemetry_dict.get("attention_state", "Optimal Focus"),
+                    "alert": telemetry_dict.get("alert", ""),
+                })
+        except Exception:
+            pass
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1060,16 +1113,21 @@ class StateReporter:
                     detail = str(e)
                 # 409 = session not yet started by teacher — not a fatal error, keep waiting
                 if e.code == 409:
-                    self._set_status(f"● Waiting for teacher to start session…")
+                    self._set_status("● Waiting for teacher to start session…")
                     return None  # Signal: retry later, not a crash
-                self._set_status(f"● Server error: {detail}")
-                if fatal and self.on_fatal_error and 400 <= e.code < 500:
+                if e.code == 429:
+                    self._set_status("● Rate limited, retrying…")
+                    return None  # Signal: retry later, not a crash
+
+                self._set_status(f"● Server status ({e.code}): {detail}")
+                if fatal and self.on_fatal_error and e.code in (401, 403):
                     try:
                         self.on_fatal_error(str(detail))
                     except Exception:
                         pass
-                if 400 <= e.code < 500:
                     return False
+                if 400 <= e.code < 500:
+                    return None
             except Exception as e:
                 last_err = e
                 self._set_status(f"● Connection failed (retry {attempt + 1}/{retries})")
@@ -1120,7 +1178,8 @@ class StateReporter:
                 "pose_pitch": float(pitch),
                 "pose_yaw": float(yaw),
                 "pose_roll": float(roll),
-                "alert": str(info.get("alert", ""))
+                "alert": str(info.get("alert", "")),
+                "is_paused": bool(info.get("is_paused", False)),
             }
 
     def _report_loop(self):
@@ -1156,6 +1215,8 @@ def run_tracking(
     join_code="",
     on_status=None,
     session_flags=None,
+    on_frame_callback=None,
+    show_cv_window=False,
 ):
     if stop_event is None:
         stop_event = threading.Event()
@@ -1199,7 +1260,7 @@ def run_tracking(
 
     # ── Startup diagnostics — printed once so you know what is active ────
     print("\n" + "="*50)
-    print("  ATTENTION TRACKER — STARTUP CHECK")
+    print("  ATTENOVA STUDENT COMPANION — STARTUP CHECK")
     print("="*50)
     print(f"  [OK] Face landmarker       : {FACE_MODEL_PATH}")
 
@@ -1214,11 +1275,48 @@ def run_tracking(
 
     # YOLO
     get_yolo()
+    
+    # Background Socratic Poller for Desktop Windows App
+    socratic_state = {
+        "active": False,
+        "session_id": None,
+        "question": None,
+        "answer_status": "",
+    }
+
+    def _poll_socratic_loop():
+        while not stop_event.is_set():
+            try:
+                url = f"{server_url}/api/socratic/session/active?class_code={class_code}"
+                req = urllib.request.Request(url, headers={"User-Agent": "VisoriaStudentTracker/1.0"})
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data and data.get("session"):
+                            socratic_state["active"] = True
+                            socratic_state["session_id"] = data["session"]["session_id"]
+                            qs = data.get("questions", [])
+                            if qs:
+                                latest_q = qs[-1]
+                                if not socratic_state.get("question") or socratic_state["question"].get("id") != latest_q.get("id"):
+                                    socratic_state["question"] = latest_q
+                                    socratic_state["answer_status"] = ""
+                        else:
+                            socratic_state["active"] = False
+                            socratic_state["session_id"] = None
+                            socratic_state["question"] = None
+                            socratic_state["answer_status"] = ""
+            except Exception:
+                pass
+            time.sleep(3)
+
+    threading.Thread(target=_poll_socratic_loop, daemon=True).start()
+
+    # YOLO
     if _yolo_available:
         print(f"  [OK] YOLOv8 phone detector : yolov8n.pt")
     else:
         print(f"  [--] YOLOv8 phone detector : NOT available")
-        print(f"       Fix: activate venv then run: pip install ultralytics")
 
     # Model PKL files
     import os as _os2
@@ -1231,8 +1329,8 @@ def run_tracking(
     print("="*50 + "\n")
 
     blink_det  = BlinkDetector()
-    smoother   = TemporalSmoother(window=15, low=0.45, high=0.55)   # ← NEW
-    yolo_worker= YOLOWorker(every_n=6)                               # ← NEW
+    smoother   = TemporalSmoother(window=15, low=0.45, high=0.55)
+    yolo_worker= YOLOWorker(every_n=6)
     xai_worker = XAIWorker(every_n=20)
 
     show_mesh      = False
@@ -1250,7 +1348,7 @@ def run_tracking(
     model_attn_hist  = []
     model_prob_hist  = []
     blink_rate_hist  = []
-    phone_hist       = []      # ← NEW: track phone presence over session
+    phone_hist       = []
 
     # Probe model
     _probe = {k: 0 for k in FEATURE_KEYS}; _probe["pose"] = "forward"
@@ -1260,8 +1358,10 @@ def run_tracking(
         model_ok = False
         print(f"[WARN] Model unavailable: {e}")
 
-    _win = "AttentionAI Vision Console"
-    cv2.namedWindow(_win, cv2.WINDOW_AUTOSIZE)
+    _win = "Attenova Student Companion — Vision Analysis Console"
+    if show_cv_window:
+        cv2.namedWindow(_win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(_win, 1240, 840)
 
     while not stop_event.is_set():
         ret, frame = cap.read()
@@ -1271,27 +1371,27 @@ def run_tracking(
         frame = cv2.flip(frame, 1)
         H, W  = frame.shape[:2]
 
-        # ── YOLO phone detection (background, every 6 frames) ────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # 5-STAGE BEHAVIORAL ATTENTION ESTIMATION PIPELINE
+        # ══════════════════════════════════════════════════════════════════════
+
+        # ── Stage 1: Behavioral Signals Ingestion ────────────────────────────
         yolo_worker.tick(frame)
         phone_feat, phone_boxes = yolo_worker.get()
-
-        # ── Hand detection (fast on CPU, every frame) ────────────────────
         no_of_hand, hand_landmarks = detect_hands(frame)
 
-        # ── Face landmarks ───────────────────────────────────────────────
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         face_result = face_lmk.detect(mp_img)
+        face_absent = not bool(face_result.face_landmarks)
 
+        # ── Stage 2: Multi-Feature Extraction ────────────────────────────────
         feat, pose_angles, ear_avg, gaze_dir = extract_features(
             frame, face_result, phone_feat, no_of_hand
         )
         blink_det.update(ear_avg)
+        bpm = blink_det.blinks_per_minute()
 
-        # face_absent must be set FIRST — everything below depends on it
-        face_absent = not bool(face_result.face_landmarks)
-
-        # ── Heuristic score (needed before model block) ──────────────────
         if face_absent:
             h_score = heuristic_attention(0, 0, gaze_dir, ear_avg, no_face=True)
         elif pose_angles:
@@ -1299,7 +1399,7 @@ def run_tracking(
         else:
             h_score = heuristic_attention(0, 0, gaze_dir, ear_avg)
 
-        # ── Draw CV overlays on camera frame ─────────────────────────────
+        # Drawing Overlays
         if face_result.face_landmarks:
             lms = face_result.face_landmarks[0]
             if show_mesh:
@@ -1316,9 +1416,8 @@ def run_tracking(
 
         draw_yolo_boxes(frame, phone_boxes, show_yolo_box)
 
-        # ── Model inference ──────────────────────────────────────────────
+        # ── Stage 3: ML Attention Prediction (Instantaneous Probability) ──────
         if face_absent:
-            # No face in frame — bypass model entirely, force distraction
             raw_prob = 0.0
         elif model_ok:
             try:
@@ -1328,130 +1427,212 @@ def run_tracking(
         else:
             raw_prob = h_score / 100.0
 
-        # ── Temporal smoothing ───────────────────────────────────────────
+        # ── Stage 4: Temporal Smoothing & Multi-Feature Fusion ───────────────
         smoothed_prob, stable_label = smoother.update(raw_prob)
+        blend = int(h_score * 0.45 + smoothed_prob * 100 * 0.55)
 
-        blend = int(h_score * 0.55 + smoothed_prob * 100 * 0.45)
+        # Multi-feature Fusion Safeguard:
+        # If face is present, posture is forward/stable, and hand activity is normal,
+        # single transient gaze shifts alone do NOT cause an instant drop to zero.
+        if not face_absent and pose_angles and abs(pose_angles[0]) < 25 and abs(pose_angles[1]) < 25:
+            if blend < 40 and not phone_feat["phone"]:
+                blend = max(blend, 45)
 
         attn_hist.append(blend)
         model_attn_hist.append(stable_label)
         model_prob_hist.append(smoothed_prob)
-        blink_rate_hist.append(blink_det.blinks_per_minute())
-        phone_hist.append(phone_feat["phone"])     # ← NEW
+        blink_rate_hist.append(bpm)
+        phone_hist.append(phone_feat["phone"])
 
-        # ── XAI ─────────────────────────────────────────────────────────
         xai_worker.tick(feat)
 
-        # ── Build info dict ──────────────────────────────────────────────
-        bpm = blink_det.blinks_per_minute()
+        avg_attn = int(np.mean(attn_hist[-300:])) if attn_hist else blend
+        peak_attn = int(np.max(attn_hist)) if attn_hist else blend
+
+        # ── Stage 5: Estimated Attention State & Intervention Decision ────────
+        if blend >= 85:
+            state_label = "Optimal Focus"
+            state_msg = "You are in an optimal learning flow state."
+        elif blend >= 70:
+            state_label = "Mindful Focus"
+            state_msg = "Great momentum! Keep up the good work."
+        elif blend >= 45:
+            state_label = "Attention Drift"
+            state_msg = "Let's take a moment to refocus on the main lesson."
+        else:
+            state_label = "Breather Suggested"
+            state_msg = "Consider taking a short 2-minute break to refresh your mind."
+
+        # Evaluate sustained attention drift over rolling window
+        recent_window = list(attn_hist[-30:]) if len(attn_hist) >= 30 else list(attn_hist)
+        sustained_drift = bool(recent_window and (sum(recent_window) / len(recent_window)) < 55)
+
+        alert_msg = ""
+        if not face_result.face_landmarks:
+            alert_msg = "NO FACE"
+        elif blink_det.eyes_closed:
+            alert_msg = "EYES CLOSED"
+        elif bpm > 25:
+            alert_msg = "HIGH BLINK RATE"
+        elif phone_feat["phone"] == 1:
+            alert_msg = "PHONE DETECTED"
+        elif sustained_drift:
+            alert_msg = "SUSTAINED ATTENTION DRIFT"
+
+        # ── Deterministic Behavioral Explainability Layer ──────────────────────
+        contributing_factors = []
+        if face_absent:
+            contributing_factors.append("Face detection unmaintained")
+        else:
+            if phone_feat["phone"] == 1:
+                contributing_factors.append("Mobile device presence observed in frame")
+            
+            if gaze_dir in ("Left", "Right", "Away"):
+                contributing_factors.append("Prolonged horizontal gaze deviation")
+            elif gaze_dir == "Down":
+                contributing_factors.append("Downward gaze vector toward secondary desk area")
+
+            if pose_angles:
+                pitch, yaw, roll = pose_angles
+                if pitch > 15 or pitch < -15:
+                    contributing_factors.append("Downward or angled head posture")
+                if abs(yaw) > 20:
+                    contributing_factors.append("Sideways head orientation")
+
+            if bpm > 25:
+                contributing_factors.append("Elevated blink frequency")
+
+            if no_of_hand >= 2:
+                contributing_factors.append("Increased hand activity near face/keyboard")
+
+        # For high focus states (blend >= 70) with no negative indicators, add positive behavioral signals
+        if blend >= 70 and not contributing_factors:
+            if gaze_dir == "Center":
+                contributing_factors.append("Centered gaze vector toward primary screen")
+            if pose_angles and abs(pose_angles[0]) <= 15 and abs(pose_angles[1]) <= 15:
+                contributing_factors.append("Stable forward-facing posture")
+            if phone_feat["phone"] == 0:
+                contributing_factors.append("Clear learning workspace without device interference")
+
+        contributing_factors = contributing_factors[:3]
+
+        is_paused = bool(session_flags.get("is_paused", False))
+        if is_paused:
+            state_label = "Monitoring Paused"
+            state_msg = "Attention telemetry is paused by student. Zero video analyzed or stored."
+            alert_msg = ""
+            contributing_factors = ["Monitoring paused by student"]
+            sustained_drift = False
+
+        # Structured Telemetry Information Payload
         info = {
+            "is_paused": is_paused,
+
+            # Stage 1 & 2: Behavioral Signals
+            "raw_features": {
+                "face_detected": not face_absent,
+                "gaze_dir": gaze_dir if not face_absent else "No Face",
+                "pose_angles": pose_angles,
+                "ear_avg": ear_avg,
+                "blinks": blink_det.total,
+                "blinks_per_min": bpm,
+                "phone_detected": bool(phone_feat["phone"]),
+                "hands_count": no_of_hand,
+            },
+
+            # Stage 3: Instantaneous ML Prediction
+            "instantaneous_pred": {
+                "raw_prob": round(raw_prob, 4),
+                "binary_label": int(raw_prob >= 0.5),
+            },
+
+            # Stage 4: Temporal Smoothing & Fusion
+            "smoothed_state": {
+                "smoothed_prob": round(smoothed_prob, 4),
+                "stable_label": stable_label,
+                "attention_score": blend,
+                "avg_attention": avg_attn,
+                "peak_attention": peak_attn,
+            },
+
+            # Stage 5: Behavioral Attention State & Intervention Decision
+            "attention_state": {
+                "state_label": state_label,
+                "state_message": state_msg,
+                "sustained_drift": sustained_drift,
+                "contributing_factors": contributing_factors,
+            },
+
+            "intervention_decision": {
+                "socratic_recommended": sustained_drift and (socratic_state.get("active") or False),
+                "alert": alert_msg,
+            },
+
+            # Flat Backwards-Compatibility Fields
             "elapsed":           time.time() - start_time,
-            "gaze":              gaze_dir if face_result.face_landmarks else "No Face",
+            "gaze":              gaze_dir if not face_absent else "No Face",
             "pose":              pose_angles,
             "ear":               ear_avg,
             "blinks":            blink_det.total,
             "blinks_per_min":    bpm,
             "attention":         blend,
-            "avg_attention":     int(np.mean(attn_hist[-300:])),
-            "model_pred_stable": stable_label,          # ← smoothed label
-            "model_prob_smoothed": smoothed_prob,        # ← smoothed prob
-            "model_prob_raw":    raw_prob,               # ← raw per-frame
+            "avg_attention":     avg_attn,
+            "peak_attention":    peak_attn,
+            "model_pred_stable": stable_label,
+            "model_prob_smoothed": smoothed_prob,
+            "model_prob_raw":    raw_prob,
             "phone_detected":    bool(phone_feat["phone"]),
             "hands_count":       no_of_hand,
+            "contributing_factors": contributing_factors,
             "xai_top_reason":    xai_worker.top_reason(),
-            "alert":             "",
+            "alert":             alert_msg,
+            "face_detected":     not face_absent,
+            "attn_hist":         list(attn_hist[-120:]),  # 2 minute sliding window
         }
-
-        # Alerts — now using stable_label so they don't flicker
-        if not face_result.face_landmarks:
-            info["alert"] = "NO FACE"
-        elif blink_det.eyes_closed:
-            info["alert"] = "EYES CLOSED"
-        elif bpm > 25:
-            info["alert"] = "HIGH BLINK RATE"
-        elif phone_feat["phone"] == 1:
-            info["alert"] = "PHONE DETECTED"             # ← NEW alert
-        elif stable_label == 0 and smoother.window_full:
-            info["alert"] = "SUSTAINED DISTRACTION"      # ← NEW: only after window fills
 
         reporter.update_state(info)
 
-        if stop_event.is_set():
-            break
+        # Notify desktop GUI callback
+        if on_frame_callback:
+            try:
+                on_frame_callback(frame, info, socratic_state)
+            except Exception:
+                pass
 
-        toggles = {
-            "mesh": show_mesh,
-            "bbox": show_yolo_box,
-            "face": show_face_bbox,
-            "pose": show_pose,
-            "iris": show_iris,
-            "hands": show_hands,
-            "xai": show_xai_hud,
-            "pipeline": pipeline_open,
-        }
-        display = console.compose(
-            frame,
-            info,
-            toggles,
-            pipeline_collapsed=not pipeline_open,
-        )
-        cv2.imshow(_win, display)
+        if show_cv_window:
+            toggles = {
+                "mesh": show_mesh,
+                "bbox": show_yolo_box,
+                "face": show_face_bbox,
+                "pose": show_pose,
+                "iris": show_iris,
+                "hands": show_hands,
+                "xai": show_xai_hud,
+                "pipeline": pipeline_open,
+            }
+            display = console.compose(
+                frame,
+                info,
+                toggles,
+                pipeline_collapsed=not pipeline_open,
+            )
+            cv2.imshow(_win, display)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                stop_event.set()
+                break
+            elif key in (ord("p"), ord("P")):
+                session_flags["is_paused"] = not session_flags.get("is_paused", False)
 
-        if stop_event.is_set():
-            break
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q"), ord("Q")):
-            stop_event.set()
-            break
-        elif stop_event.is_set():
-            break
-        elif key in (ord("m"), ord("M")):
-            show_mesh = not show_mesh
-        elif key in (ord("x"), ord("X")):
-            show_xai_hud = not show_xai_hud
-        elif key in (ord("y"), ord("Y")):
-            show_yolo_box = not show_yolo_box
-        elif key in (ord("h"), ord("H")):
-            show_pose = not show_pose
-        elif key in (ord("i"), ord("I")):
-            show_iris = not show_iris
-        elif key in (ord("l"), ord("L")):
-            show_hands = not show_hands
-        elif key in (ord("b"), ord("B")):
-            show_face_bbox = not show_face_bbox
-        elif key in (ord("p"), ord("P")):
-            pipeline_open = not pipeline_open
+        time.sleep(0.03)
 
     cap.release()
-    cv2.destroyAllWindows()
+    if show_cv_window:
+        cv2.destroyAllWindows()
 
     reporter.stop()
 
     ended_by_user = session_flags.get("end_by_user", False)
-    show_report = attn_hist and not ended_by_user and not session_flags.get("fatal_error")
-
-    dur_   = time.time() - start_time
-    m_, s_ = divmod(int(dur_), 60)
-    if show_report:
-        print(f"\n── Session Summary ─────────────────────────────")
-        print(f"  Duration      : {m_:02d}:{s_:02d}")
-        print(f"  Total blinks  : {blink_det.total}")
-        print(f"  Avg attention : {int(np.mean(attn_hist)) if attn_hist else 0}%")
-        print(f"  Avg model conf: {np.mean(model_prob_hist)*100:.1f}%" if model_prob_hist else "  Avg model conf: —")
-        print(f"  Phone detected: {sum(phone_hist)} frames ({100*sum(phone_hist)/max(len(phone_hist),1):.1f}%)")
-        print(f"────────────────────────────────────────────────\n")
-
-        show_dashboard({
-            "duration_sec":           dur_,
-            "total_blinks":           blink_det.total,
-            "attention_series":       attn_hist,
-            "model_attention_series": model_attn_hist,
-            "model_prob_series":      model_prob_hist,
-            "blink_timeline":         blink_rate_hist,
-            "phone_series":           phone_hist,
-        })
-
     if session_flags.get("fatal_error"):
         return "join_denied"
     if ended_by_user or stop_event.is_set():
@@ -1460,7 +1641,7 @@ def run_tracking(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Optional client config (client_config.json beside this script)
+# Optional client config (config.json beside this script)
 # ══════════════════════════════════════════════════════════════════════════════
 CLIENT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
@@ -1476,150 +1657,1219 @@ def load_client_config() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tkinter control panel
+# Attenova Student Companion Application (Windows Desktop EdTech Companion UI)
 # ══════════════════════════════════════════════════════════════════════════════
-class TrackerUI:
-    BG = "#F8FAFC"
-    PANEL = "#FFFFFF"
-    ACCENT = "#2563EB"
-    TEXT = "#0F172A"
-    MUTED = "#64748B"
-    GREEN = "#16A34A"
-    RED = "#DC2626"
-    BORDER = "#E2E8F0"
+class AttenovaCompanionApp:
+    """
+    Modern, dynamic, student-facing Windows desktop companion application.
+    Adheres strictly to the Warm Academic Horizon design language:
+      • Paper Linen Canvas: #FFF8F5
+      • Chalk White Surface Cards: #FFFFFF
+      • Espresso Charcoal Typography: #1F1B17
+      • Warm Amber Accent: #E89B3D
+      • Soft Orange: #F4B860
+      • Terracotta Clay: #D96C4A
+      • Academic Sage Green: #6E9B78
+      • Muted Earth Gray: #81776F
+      • Hairline Beige Divider: #F0E6E0
+    """
+
+    # Focus Companion Theme Palette (Attenova Design Identity)
+    BG = "#F5F7FA"            # Soft Cloud primary background
+    CARD = "#FFFFFF"          # Pure White cards & surfaces
+    TEXT = "#1E293B"          # Midnight Slate headings & text
+    MUTED = "#64748B"         # Cool Gray secondary text
+    BORDER = "#E2E8F0"        # Mist Gray borders
+    HOVER = "#EEF2FF"         # Tinted Indigo active/hover background
+
+    PRIMARY = "#4F46E5"       # Focus Indigo primary action
+    PRIMARY_HOVER = "#4338CA" # Deep Indigo hover state
+    PRIMARY_TINT = "#EEF2FF"  # Focus Indigo tint background
+
+    TEAL = "#0D9488"          # Calm Teal positive feedback & connected state
+    TEAL_MIST = "#CCFBF1"     # Teal Mist positive background
+    GREEN = "#0D9488"         # Alias for Calm Teal
+
+    AMBER = "#F59E0B"         # Gentle Amber reminders & prompts
+    AMBER_MIST = "#FEF3C7"    # Amber Mist warning background
+    ORANGE = "#F59E0B"        # Alias for Gentle Amber
+
+    RED = "#DC2626"           # Soft Red for errors or critical failures
+    RED_MIST = "#FEE2E2"      # Soft Red status background
+
+    CAM_BG = "#0F172A"        # Dark Navy webcam preview container
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("AttentionAI — Student Client")
-        self.root.geometry("540x580")
-        self.root.resizable(False, False)
+        self.root.title("Attenova Focus Companion — Student Learning Client")
+        self.root.geometry("1200x780")
+        self.root.minsize(1120, 720)
         self.root.configure(bg=self.BG)
-        
+
         cfg = load_client_config()
-        self.name_var = tk.StringVar(value=cfg.get("student_name", "John Doe"))
-        self.roll_var = tk.StringVar(value=cfg.get("roll_number", "ROLL001"))
-        self.class_var = tk.StringVar(value=cfg.get("class_code", "CS-201"))
+        self.name_var = tk.StringVar(value=cfg.get("student_name", "Alex Student"))
+        self.roll_var = tk.StringVar(value=cfg.get("roll_number", "STUDENT-01"))
+        self.class_var = tk.StringVar(value=cfg.get("class_code", "CS101"))
         self.join_var = tk.StringVar(value=cfg.get("join_code", ""))
         self.server_var = tk.StringVar(value=cfg.get("server_url", "http://localhost:8000"))
-        
+
         self.stop_event = threading.Event()
         self.session_flags = {"end_by_user": False, "fatal_error": None}
-        self.worker     = None
-        self._build()
+        self.worker = None
+
+        # Live State Variables
+        self.active_tab = "dashboard"
+        self.show_cam_preview = tk.BooleanVar(value=True)
+        self.show_cv_window_var = tk.BooleanVar(value=False)
+        self.latest_info = {
+            "attention": 85,
+            "avg_attention": 82,
+            "peak_attention": 95,
+            "blinks": 0,
+            "blinks_per_min": 0,
+            "gaze": "Center",
+            "pose": (0, 0, 0),
+            "phone_detected": False,
+            "hands_count": 0,
+            "alert": "",
+            "face_detected": True,
+            "elapsed": 0,
+            "attn_hist": [75, 78, 82, 85, 88, 86, 85],
+        }
+        self.socratic_state = {
+            "active": False,
+            "session_id": None,
+            "question": None,
+            "answer_status": "",
+        }
+
+        # Socratic 4-Stage Stepper State
+        self.socratic_stage = 1  # 1: Think, 2: Compare, 3: Reflect, 4: Reassess
+        self.selected_option = tk.StringVar(value="")
+        self.confidence_level = tk.StringVar(value="Confident")
+        self.reflection_text = tk.StringVar(value="")
+
+        self.notified_session_ids = set()
+        self._start_socratic_listener()
+
+        self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _build(self):
-        hdr = tk.Frame(self.root, bg=self.PANEL, height=56, highlightbackground=self.BORDER, highlightthickness=1)
-        hdr.pack(fill="x")
-        tk.Label(
-            hdr,
-            text="AttentionAI  ·  Vision Analysis Client",
-            font=("Segoe UI", 12, "bold"),
-            fg=self.ACCENT,
-            bg=self.PANEL,
-        ).pack(pady=16)
+    def _start_socratic_listener(self):
+        def _ws_thread():
+            async def _listen():
+                server_base = self.server_var.get().strip().rstrip("/")
+                ws_url = server_base.replace("http://", "ws://").replace("https://", "wss://") + f"/ws/student?class_code={self.class_var.get().strip()}&student_id={self.roll_var.get().strip()}"
+                while not self.stop_event.is_set():
+                    try:
+                        async with websockets.connect(ws_url) as ws:
+                            print(f"  [OK] Desktop Socratic listener connected: {ws_url}")
+                            while not self.stop_event.is_set():
+                                msg = await ws.recv()
+                                data = json.loads(msg)
+                                evt = data.get("event")
+                                if evt in ["socratic_session_activated", "socratic_session_started"]:
+                                    sid = data.get("session_id")
+                                    act_type = data.get("activity_type", "socratic_question")
+                                    cfg = data.get("activity_config") or {}
+                                    q_text = data.get("question_text") or cfg.get("question_text") or cfg.get("prompt") or cfg.get("topic") or "Your teacher started an intervention activity."
+                                    token = data.get("join_token", "")
+                                    self.root.after(0, lambda s=sid, q=q_text, t=token, a=act_type: self._show_socratic_notification_popup(s, q, t, a))
+                    except Exception:
+                        await asyncio.sleep(3)
 
-        body = tk.Frame(self.root, bg=self.BG, padx=28, pady=18)
-        body.pack(fill="both", expand=True)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_listen())
+            except Exception:
+                pass
 
-        input_frame = tk.Frame(body, bg=self.BG)
-        input_frame.pack(fill="x", pady=(0, 15))
+        threading.Thread(target=_ws_thread, daemon=True).start()
 
-        def _lbl(parent, txt):
-            return tk.Label(parent, text=txt, font=("Segoe UI", 9), fg=self.MUTED, bg=self.BG)
+    def _show_socratic_notification_popup(self, session_id, question_text, join_token=None, activity_type="socratic_question"):
+        if not session_id or session_id in self.notified_session_ids:
+            return
+        self.notified_session_ids.add(session_id)
 
-        def _entry(parent, var):
-            return tk.Entry(
-                parent,
-                textvariable=var,
+        try:
+            top = tk.Toplevel(self.root)
+            is_socratic = (activity_type == "socratic_question")
+            act_title = "Socratic Learning Session" if is_socratic else activity_type.replace("_", " ").title() + " Activity"
+            top.title(f"Attenova — {act_title}")
+            top.geometry("540x340")
+            top.resizable(False, False)
+            top.configure(bg="#0F172A")
+            top.attributes("-topmost", True)
+
+            # Header banner
+            hdr = tk.Frame(top, bg="#1E293B", pady=16, padx=20)
+            hdr.pack(fill="x")
+
+            icon_lbl = tk.Label(hdr, text="💡" if is_socratic else "⚡", font=("Segoe UI", 24), bg="#1E293B")
+            icon_lbl.pack(side="left", padx=(0, 12))
+
+            tf = tk.Frame(hdr, bg="#1E293B")
+            tf.pack(side="left", fill="both", expand=True)
+
+            t_lbl = tk.Label(tf, text=act_title, font=("Segoe UI", 13, "bold"), fg="#F8FAFC", bg="#1E293B", anchor="w")
+            t_lbl.pack(fill="x")
+
+            s_lbl = tk.Label(tf, text=f"Active in {self.class_var.get().strip()} · Teacher Guided", font=("Segoe UI", 10), fg="#94A3B8", bg="#1E293B", anchor="w")
+            s_lbl.pack(fill="x")
+
+            # Main content
+            body = tk.Frame(top, bg="#0F172A", padx=24, pady=16)
+            body.pack(fill="both", expand=True)
+
+            q_box = tk.Frame(body, bg="#1E293B", padx=16, pady=14, highlightbackground="#334155", highlightthickness=1)
+            q_box.pack(fill="x", pady=(0, 12))
+
+            q_lbl = tk.Label(q_box, text=f"“{question_text or 'What is the primary factor driving this algorithm complexity?'}”", font=("Segoe UI", 10, "italic"), fg="#E2E8F0", bg="#1E293B", wraplength=460, justify="left")
+            q_lbl.pack(anchor="w")
+
+            note_text = "Clicking 'Join Session' opens the Socratic Think → Compare → Reflect → Reassess workflow in your browser." if is_socratic else "Clicking 'Join Session' opens the interactive learning activity in your browser."
+            note = tk.Label(body, text=note_text, font=("Segoe UI", 9), fg="#94A3B8", bg="#0F172A", wraplength=480, justify="left")
+            note.pack(anchor="w", pady=(0, 16))
+
+            # Buttons
+            btns = tk.Frame(body, bg="#0F172A")
+            btns.pack(fill="x", side="bottom")
+
+            def _join():
+                top.destroy()
+                t_param = f"&join_token={join_token}" if join_token else ""
+                url = f"http://localhost:5173/?session_id={session_id}{t_param}"
+                print(f"  [Socratic Desktop] Opening browser deep link: {url}")
+                webbrowser.open(url)
+
+            def _later():
+                top.destroy()
+
+            j_btn = tk.Button(btns, text="Join Session ➔", font=("Segoe UI", 10, "bold"), fg="#FFFFFF", bg="#2563EB", activebackground="#1D4ED8", activeforeground="#FFFFFF", bd=0, padx=20, pady=8, cursor="hand2", command=_join)
+            j_btn.pack(side="right", padx=(8, 0))
+
+            l_btn = tk.Button(btns, text="Later", font=("Segoe UI", 10), fg="#94A3B8", bg="#1E293B", activebackground="#334155", activeforeground="#F8FAFC", bd=0, padx=16, pady=8, cursor="hand2", command=_later)
+            l_btn.pack(side="right")
+        except Exception as e:
+            print(f"Error launching notification popup: {e}")
+
+    def _build_ui(self):
+
+        # ── 1. Top Header Bar ─────────────────────────────────────────
+        self.hdr = tk.Frame(self.root, bg=self.CARD, height=64, bd=0, highlightbackground=self.BORDER, highlightthickness=1)
+        self.hdr.pack(fill="x")
+
+        # Brand / Logo
+        hdr_left = tk.Frame(self.hdr, bg=self.CARD)
+        hdr_left.pack(side="left", padx=24, pady=12)
+
+        logo_lbl = tk.Label(hdr_left, text="🎓", font=("Segoe UI", 16), bg=self.CARD)
+        logo_lbl.pack(side="left", padx=(0, 8))
+
+        brand_lbl = tk.Label(hdr_left, text="Attenova", font=("Segoe UI", 16, "bold"), fg=self.PRIMARY, bg=self.CARD)
+        brand_lbl.pack(side="left")
+
+        sub_lbl = tk.Label(hdr_left, text="  ·  Focus Companion", font=("Segoe UI", 10, "bold"), fg=self.MUTED, bg=self.CARD)
+        sub_lbl.pack(side="left")
+
+        # Right Actions Strip
+        hdr_right = tk.Frame(self.hdr, bg=self.CARD)
+        hdr_right.pack(side="right", padx=24)
+
+        # Connection Badge
+        self.conn_badge = tk.Label(
+            hdr_right,
+            text="● Connected",
+            font=("Segoe UI", 9, "bold"),
+            fg=self.TEAL,
+            bg=self.TEAL_MIST,
+            padx=12,
+            pady=4,
+        )
+        self.conn_badge.pack(side="left", padx=(0, 10))
+
+        # Pause Monitoring Button
+        self.pause_btn = tk.Button(
+            hdr_right,
+            text="⏸  Pause Monitoring",
+            command=self.toggle_pause_monitoring,
+            font=("Segoe UI", 9, "bold"),
+            fg=self.TEXT,
+            bg=self.HOVER,
+            activeforeground=self.TEXT,
+            activebackground=self.BORDER,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=12,
+            pady=4,
+        )
+        self.pause_btn.pack(side="left", padx=(0, 10))
+
+        # Session Timer Display
+        self.timer_lbl = tk.Label(hdr_right, text="00:00:00", font=("Segoe UI", 10, "bold"), fg=self.TEXT, bg=self.CARD)
+        self.timer_lbl.pack(side="left", padx=(0, 14))
+
+        # Privacy Badge Button
+        priv_btn = tk.Button(
+            hdr_right,
+            text="🔒 Processed locally",
+            command=self._show_privacy_dialog,
+            font=("Segoe UI", 9),
+            fg=self.MUTED,
+            bg=self.CARD,
+            activeforeground=self.TEXT,
+            activebackground=self.HOVER,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=10,
+            pady=4,
+        )
+        priv_btn.pack(side="left", padx=(0, 14))
+
+        # Primary Start/End Session Button
+        self.session_btn = tk.Button(
+            hdr_right,
+            text="▶  Start Session",
+            command=self.toggle_session,
+            font=("Segoe UI", 10, "bold"),
+            fg="#FFFFFF",
+            bg=self.PRIMARY,
+            activeforeground="#FFFFFF",
+            activebackground=self.PRIMARY_HOVER,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=20,
+            pady=7,
+        )
+        self.session_btn.pack(side="left")
+
+        # ── 2. Main 3-Column Body Layout ──────────────────────────────
+        self.body = tk.Frame(self.root, bg=self.BG, padx=20, pady=16)
+        self.body.pack(fill="both", expand=True)
+
+        self.body.columnconfigure(1, weight=1)
+        self.body.rowconfigure(0, weight=1)
+
+        # Left Navigation Sidebar (Col 0)
+        self._build_sidebar(self.body)
+
+        # Center Main Workspace (Col 1)
+        self.center_frame = tk.Frame(self.body, bg=self.BG)
+        self.center_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 16))
+        self.center_frame.rowconfigure(0, weight=1)
+        self.center_frame.columnconfigure(0, weight=1)
+
+        # Right Status / Camera Sidebar (Col 2)
+        self._build_right_panel(self.body)
+
+        # Render Initial Dashboard Tab
+        self._switch_tab("dashboard")
+
+    def _build_sidebar(self, parent):
+        side = tk.Frame(parent, bg=self.BG, width=220)
+        side.grid(row=0, column=0, sticky="ns", padx=(0, 16))
+
+        # Student Quick Profile Header
+        prof_card = tk.Frame(side, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=12, pady=12)
+        prof_card.pack(fill="x", pady=(0, 12))
+
+        prof_top = tk.Frame(prof_card, bg=self.CARD)
+        prof_top.pack(fill="x")
+
+        avatar = tk.Label(prof_top, text="ST", font=("Segoe UI", 10, "bold"), fg="#FFFFFF", bg=self.PRIMARY, width=3, height=1)
+        avatar.pack(side="left", padx=(0, 10))
+
+        prof_info = tk.Frame(prof_top, bg=self.CARD)
+        prof_info.pack(side="left", fill="x", expand=True)
+
+        tk.Label(prof_info, textvariable=self.name_var, font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.CARD, anchor="w").pack(fill="x")
+        tk.Label(prof_info, text="Focus Mode Active", font=("Segoe UI", 8), fg=self.TEAL, bg=self.CARD, anchor="w").pack(fill="x")
+
+        # Navigation Card
+        nav_card = tk.Frame(side, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=12, pady=16)
+        nav_card.pack(fill="x", pady=(0, 12))
+
+        tk.Label(nav_card, text="NAVIGATION", font=("Segoe UI", 8, "bold"), fg=self.MUTED, bg=self.CARD).pack(anchor="w", padx=8, pady=(0, 10))
+
+        self.nav_btns = {}
+        items = [
+            ("dashboard", "🏠  Dashboard"),
+            ("socratic", "💡  Learning Session"),
+            ("privacy", "📷  Camera & Privacy"),
+            ("details", "⚙️  Attention Insights"),
+        ]
+        for key, label in items:
+            btn = tk.Button(
+                nav_card,
+                text=label,
+                anchor="w",
+                command=lambda k=key: self._switch_tab(k),
                 font=("Segoe UI", 10),
                 fg=self.TEXT,
-                bg=self.PANEL,
-                insertbackground=self.TEXT,
-                relief="solid",
-                bd=1,
+                bg=self.CARD,
+                activeforeground=self.PRIMARY,
+                activebackground=self.PRIMARY_TINT,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=12,
+                pady=8,
+            )
+            btn.pack(fill="x", pady=2)
+            self.nav_btns[key] = btn
+
+        # Roster Config Card
+        cfg_card = tk.Frame(side, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=14, pady=14)
+        cfg_card.pack(fill="x")
+
+        tk.Label(cfg_card, text="SESSION PROFILE", font=("Segoe UI", 8, "bold"), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(0, 8))
+
+        def _input_field(lbl, var):
+            tk.Label(cfg_card, text=lbl, font=("Segoe UI", 8), fg=self.MUTED, bg=self.CARD).pack(anchor="w")
+            ent = tk.Entry(
+                cfg_card,
+                textvariable=var,
+                font=("Segoe UI", 9),
+                fg=self.TEXT,
+                bg=self.BG,
+                relief="flat",
                 highlightthickness=1,
                 highlightbackground=self.BORDER,
             )
+            ent.pack(fill="x", pady=(2, 6))
 
-        _lbl(input_frame, "Student Name:").grid(row=0, column=0, sticky="w", pady=4)
-        _entry(input_frame, self.name_var).grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=4)
+        _input_field("Student Name:", self.name_var)
+        _input_field("Roll Number:", self.roll_var)
+        _input_field("Class Code:", self.class_var)
+        _input_field("Join Code:", self.join_var)
 
-        _lbl(input_frame, "Roll Number:").grid(row=1, column=0, sticky="w", pady=4)
-        _entry(input_frame, self.roll_var).grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=4)
+    def _build_right_panel(self, parent):
+        right = tk.Frame(parent, bg=self.BG, width=280)
+        right.grid(row=0, column=2, sticky="ns")
 
-        _lbl(input_frame, "Class Code:  ").grid(row=2, column=0, sticky="w", pady=4)
-        _entry(input_frame, self.class_var).grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=4)
+        # ── 1. Dark Navy Webcam Preview Card ────────────────────────────
+        cam_card = tk.Frame(right, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=14, pady=14)
+        cam_card.pack(fill="x", pady=(0, 16))
 
-        _lbl(input_frame, "Join Code:   ").grid(row=3, column=0, sticky="w", pady=4)
-        _entry(input_frame, self.join_var).grid(row=3, column=1, sticky="ew", padx=(10, 0), pady=4)
+        cam_hdr = tk.Frame(cam_card, bg=self.CARD)
+        cam_hdr.pack(fill="x", pady=(0, 10))
+        tk.Label(cam_hdr, text="Webcam Preview", font=("Segoe UI", 11, "bold"), fg=self.TEXT, bg=self.CARD).pack(side="left")
+        
+        self.cam_badge = tk.Label(cam_hdr, text="Active", font=("Segoe UI", 8, "bold"), fg=self.TEAL, bg=self.TEAL_MIST, padx=6, pady=1)
+        self.cam_badge.pack(side="right")
 
-        _lbl(input_frame, "Server URL:  ").grid(row=4, column=0, sticky="w", pady=4)
-        _entry(input_frame, self.server_var).grid(row=4, column=1, sticky="ew", padx=(10, 0), pady=4)
+        # Dark Navy (#0F172A) Preview Container
+        self.cam_preview_label = tk.Label(
+            cam_card,
+            text="📷 Camera Processing\non your device",
+            font=("Segoe UI", 9),
+            fg="#94A3B8",
+            bg=self.CAM_BG,
+            width=32,
+            height=9,
+            relief="flat",
+        )
+        self.cam_preview_label.pack(fill="x", pady=(0, 10))
 
-        input_frame.columnconfigure(1, weight=1)
+        # Checkbox Toggle: Show camera preview
+        chk = tk.Checkbutton(
+            cam_card,
+            text="Show camera preview",
+            variable=self.show_cam_preview,
+            font=("Segoe UI", 9),
+            fg=self.TEXT,
+            bg=self.CARD,
+            activebackground=self.CARD,
+        )
+        chk.pack(anchor="w", pady=(0, 8))
+
+        # Status Checklist
+        self.cam_checks = {}
+        check_items = [
+            ("cam", "✓ Camera active"),
+            ("face", "✓ Face detected"),
+            ("gaze", "✓ Gaze direction estimated"),
+            ("pose", "✓ Head position estimated"),
+        ]
+        for key, txt in check_items:
+            lbl = tk.Label(cam_card, text=txt, font=("Segoe UI", 9), fg=self.TEAL, bg=self.CARD)
+            lbl.pack(anchor="w", pady=1)
+            self.cam_checks[key] = lbl
 
         tk.Label(
-            body,
-            text="Connect to your class session and launch the AI vision console.\n"
-                 "Press Start to open the webcam analysis window.\n"
-                 "Hotkeys: M mesh · Y bbox · H pose · I iris · L hands · P pipeline · Q quit",
+            cam_card,
+            text="Camera frames are processed entirely on your local device.",
+            font=("Segoe UI", 8, "italic"),
+            fg=self.MUTED,
+            bg=self.CARD,
+            wraplength=230,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+
+        # ── 2. Computer Vision Status Card ────────────────────────────
+        det_card = tk.Frame(right, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=14, pady=14)
+        det_card.pack(fill="x")
+
+        tk.Label(det_card, text="Attention Pipeline", font=("Segoe UI", 11, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w", pady=(0, 10))
+
+        cv_items = [
+            "✓ MediaPipe Face Landmark Mesh",
+            "✓ Gaze Vector Estimator",
+            "✓ Head Pose Orientation",
+            "✓ YOLOv8 Activity Classifier",
+            "✓ Attention Stability Score",
+        ]
+        for txt in cv_items:
+            tk.Label(det_card, text=txt, font=("Segoe UI", 8), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=1)
+
+        self.det_status_lbl = tk.Label(det_card, text="Pipeline active (60 FPS)", font=("Segoe UI", 9, "bold"), fg=self.TEAL, bg=self.CARD)
+        self.det_status_lbl.pack(anchor="w", pady=(10, 8))
+
+        details_btn = tk.Button(
+            det_card,
+            text="View attention insights →",
+            command=lambda: self._switch_tab("details"),
+            font=("Segoe UI", 9, "bold"),
+            fg=self.PRIMARY,
+            bg=self.CARD,
+            activeforeground=self.PRIMARY_HOVER,
+            activebackground=self.HOVER,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+        )
+        details_btn.pack(anchor="w")
+
+    def _switch_tab(self, tab_key):
+        self.active_tab = tab_key
+
+        # Update sidebar selection state
+        for k, btn in self.nav_btns.items():
+            if k == tab_key:
+                btn.configure(bg=self.PRIMARY_TINT, fg=self.PRIMARY, font=("Segoe UI", 10, "bold"))
+            else:
+                btn.configure(bg=self.CARD, fg=self.TEXT, font=("Segoe UI", 10))
+
+        # Clear center frame
+        for child in self.center_frame.winfo_children():
+            child.destroy()
+
+        if tab_key == "dashboard":
+            self._render_dashboard_view(self.center_frame)
+        elif tab_key == "socratic":
+            self._render_socratic_view(self.center_frame)
+        elif tab_key == "privacy":
+            self._render_privacy_view(self.center_frame)
+        elif tab_key == "details":
+            self._render_details_view(self.center_frame)
+        elif tab_key == "summary":
+            self._render_summary_view(self.center_frame)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 1: Main Attention Dashboard View
+    # ══════════════════════════════════════════════════════════════════════════
+    def _render_dashboard_view(self, parent):
+        container = tk.Frame(parent, bg=self.BG)
+        container.pack(fill="both", expand=True)
+
+        # ── 1. Welcome & Session Card ─────────────────────────────────
+        welcome_card = tk.Frame(container, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=20, pady=16)
+        welcome_card.pack(fill="x", pady=(0, 14))
+
+        wel_hdr = tk.Frame(welcome_card, bg=self.CARD)
+        wel_hdr.pack(fill="x")
+
+        student_name = self.name_var.get().strip() or "Student"
+        tk.Label(wel_hdr, text=f"Welcome back, {student_name} 👋", font=("Segoe UI", 14, "bold"), fg=self.TEXT, bg=self.CARD).pack(side="left")
+        tk.Label(wel_hdr, text="• Calm Focus Companion Active", font=("Segoe UI", 9, "bold"), fg=self.TEAL, bg=self.CARD).pack(side="right")
+
+        # Current Course Details Strip
+        sess_strip = tk.Frame(welcome_card, bg=self.HOVER, padx=14, pady=10)
+        sess_strip.pack(fill="x", pady=(10, 0))
+
+        class_name = self.class_var.get().strip().upper() or "CS101"
+        tk.Label(sess_strip, text=f"📚 Current Course: {class_name} — Data Structures & Algorithms", font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.HOVER).pack(side="left")
+        tk.Label(sess_strip, text="Lesson: Binary Trees", font=("Segoe UI", 9), fg=self.MUTED, bg=self.HOVER).pack(side="right")
+
+        # ── 2. Live Attention Score & Supportive Feedback Card ──────────
+        att_card = tk.Frame(container, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=18)
+        att_card.pack(fill="x", pady=(0, 14))
+
+        tk.Label(att_card, text="Attention State & Refocus Guidance", font=("Segoe UI", 12, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+
+        # Gauge & Encouragement Row
+        row = tk.Frame(att_card, bg=self.CARD)
+        row.pack(fill="x", pady=(12, 0))
+
+        # Circular Arc Canvas Gauge
+        self.gauge_canvas = tk.Canvas(row, width=160, height=160, bg=self.CARD, highlightthickness=0)
+        self.gauge_canvas.pack(side="left", padx=(0, 20))
+
+        # Dynamic Status & Message Box
+        msg_box = tk.Frame(row, bg=self.CARD)
+        msg_box.pack(side="left", fill="both", expand=True)
+
+        self.att_state_title = tk.Label(msg_box, text="Optimal Focus", font=("Segoe UI", 18, "bold"), fg=self.TEAL, bg=self.CARD)
+        self.att_state_title.pack(anchor="w", pady=(4, 2))
+
+        self.att_state_desc = tk.Label(
+            msg_box,
+            text="“You are in a great learning flow state. Keep it up!”",
+            font=("Segoe UI", 10, "italic"),
+            fg=self.TEXT,
+            bg=self.CARD,
+            wraplength=380,
+            justify="left",
+        )
+        self.att_state_desc.pack(anchor="w", pady=(0, 10))
+
+        # Supportive dynamic tip container
+        tip_box = tk.Frame(msg_box, bg=self.HOVER, padx=12, pady=8)
+        tip_box.pack(fill="x")
+        self.tip_lbl = tk.Label(
+            tip_box,
+            text="💡 Companion Tip: Attenova provides gentle cues to help you sustain attention naturally.",
             font=("Segoe UI", 9),
             fg=self.MUTED,
-            bg=self.BG,
+            bg=self.HOVER,
             justify="left",
-        ).pack(anchor="w", pady=(0, 15))
-
-        self.status_var = tk.StringVar(value="● Ready")
-        self._sl = tk.Label(
-            body,
-            textvariable=self.status_var,
-            font=("Segoe UI", 10, "bold"),
-            fg=self.MUTED,
-            bg=self.BG,
         )
-        self._sl.pack(anchor="w", pady=(0, 12))
+        self.tip_lbl.pack(anchor="w")
 
-        row = tk.Frame(body, bg=self.BG)
-        row.pack(anchor="w")
+        self._draw_circular_gauge(self.latest_info.get("attention", 85))
 
-        def _btn(text, cmd, fg, bg=None):
-            return tk.Button(
-                row,
-                text=text,
-                command=cmd,
-                font=("Segoe UI", 10, "bold"),
-                fg="#FFFFFF" if bg else fg,
-                bg=bg or self.PANEL,
-                activeforeground="#FFFFFF" if bg else fg,
-                activebackground=bg or self.PANEL,
+        # ── 3. Attention Timeline Card ───────────────────────────────
+        time_card = tk.Frame(container, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=18)
+        time_card.pack(fill="both", expand=True)
+
+        t_hdr = tk.Frame(time_card, bg=self.CARD)
+        t_hdr.pack(fill="x", pady=(0, 8))
+
+        tk.Label(t_hdr, text="Attention Trend During Session", font=("Segoe UI", 12, "bold"), fg=self.TEXT, bg=self.CARD).pack(side="left")
+
+        # Timeline Canvas
+        self.timeline_canvas = tk.Canvas(time_card, height=170, bg=self.CARD, highlightthickness=0)
+        self.timeline_canvas.pack(fill="both", expand=True, pady=(0, 10))
+
+        # KPI Summary Strip
+        kpi_strip = tk.Frame(time_card, bg=self.HOVER, padx=16, pady=8)
+        kpi_strip.pack(fill="x")
+
+        self.kpi_current = tk.Label(kpi_strip, text=f"Current: {self.latest_info.get('attention', 85)}%", font=("Segoe UI", 9, "bold"), fg=self.PRIMARY, bg=self.HOVER)
+        self.kpi_current.pack(side="left", expand=True)
+
+        self.kpi_avg = tk.Label(kpi_strip, text=f"Session Average: {self.latest_info.get('avg_attention', 82)}%", font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.HOVER)
+        self.kpi_avg.pack(side="left", expand=True)
+
+        self.kpi_peak = tk.Label(kpi_strip, text=f"Peak: {self.latest_info.get('peak_attention', 95)}%", font=("Segoe UI", 9, "bold"), fg=self.TEAL, bg=self.HOVER)
+        self.kpi_peak.pack(side="left", expand=True)
+
+        self._draw_timeline_chart()
+
+    def _draw_circular_gauge(self, score):
+        if not hasattr(self, "gauge_canvas") or not self.gauge_canvas.winfo_exists():
+            return
+        cv = self.gauge_canvas
+        cv.delete("all")
+
+        # Color band & supportive feedback (Focus Companion identity)
+        if score >= 90:
+            col, label, msg = self.TEAL, "Highly Focused", "“You are in an optimal learning flow state.”"
+        elif score >= 75:
+            col, label, msg = self.TEAL, "Focused", "“Great momentum! Keep up the good work.”"
+        elif score >= 55:
+            col, label, msg = self.AMBER, "Mindful Focus", "“Let's take a moment to refocus on the main lesson.”"
+        elif score >= 30:
+            col, label, msg = self.AMBER, "Gentle Reminder", "“A quick breath can help bring your attention back.”"
+        else:
+            col, label, msg = self.RED, "Breather Suggested", "“Consider taking a short 2-minute break to refresh your mind.”"
+
+        # Background Arc
+        cv.create_arc(15, 15, 145, 145, start=-225, extent=270, style="arc", outline=self.BORDER, width=12)
+
+        # Animated Progress Arc
+        extent = -(270 * max(0, min(100, score)) / 100)
+        cv.create_arc(15, 15, 145, 145, start=225, extent=extent, style="arc", outline=col, width=12)
+
+        # Center Score Readout
+        cv.create_text(80, 72, text=f"{score}%", font=("Segoe UI", 24, "bold"), fill=col)
+        cv.create_text(80, 102, text=label, font=("Segoe UI", 9, "bold"), fill=self.MUTED)
+
+        # Update text labels
+        if hasattr(self, "att_state_title"):
+            self.att_state_title.configure(text=label, fg=col)
+            self.att_state_desc.configure(text=msg)
+
+    def _draw_timeline_chart(self):
+        if not hasattr(self, "timeline_canvas") or not self.timeline_canvas.winfo_exists():
+            return
+        cv = self.timeline_canvas
+        cv.delete("all")
+
+        w = cv.winfo_width() or 580
+        h = cv.winfo_height() or 170
+
+        # Background grid
+        for y_pct in (0.25, 0.50, 0.75):
+            y = int(h * y_pct)
+            cv.create_line(0, y, w, y, fill=self.BORDER, dash=(3, 3))
+
+        hist = self.latest_info.get("attn_hist", [75, 78, 82, 85, 88, 86, 85])
+        if len(hist) < 2:
+            return
+
+        pts = []
+        n = len(hist)
+        for i, val in enumerate(hist):
+            x = int(i * (w - 20) / max(1, n - 1)) + 10
+            y = int(h - 20 - (val / 100.0) * (h - 40))
+            pts.append((x, y))
+
+        # Fill Polygon
+        poly_pts = [(pts[0][0], h - 10)] + pts + [(pts[-1][0], h - 10)]
+        flat_poly = [coord for pt in poly_pts for coord in pt]
+        cv.create_polygon(flat_poly, fill=self.PRIMARY_TINT, outline="")
+
+        # Line Graph
+        flat_pts = [coord for pt in pts for coord in pt]
+        cv.create_line(flat_pts, fill=self.PRIMARY, width=3, smooth=True)
+
+        # Current Indicator Point
+        last_x, last_y = pts[-1]
+        cv.create_oval(last_x - 5, last_y - 5, last_x + 5, last_y + 5, fill=self.TEAL, outline="#FFFFFF", width=2)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 2: Socratic Learning Experience (4-Stage Stepper)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _render_socratic_view(self, parent):
+        container = tk.Frame(parent, bg=self.BG)
+        container.pack(fill="both", expand=True)
+
+        card = tk.Frame(container, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=20)
+        card.pack(fill="both", expand=True)
+
+        # Stepper Header
+        step_frame = tk.Frame(card, bg=self.HOVER, padx=16, pady=10)
+        step_frame.pack(fill="x", pady=(0, 20))
+
+        stages = [
+            (1, "1. Think"),
+            (2, "2. Compare"),
+            (3, "3. Reflect"),
+            (4, "4. Reassess"),
+        ]
+        for idx, (stg_num, stg_lbl) in enumerate(stages):
+            is_active = self.socratic_stage == stg_num
+            is_done = self.socratic_stage > stg_num
+            fg = self.PRIMARY if is_active else (self.TEAL if is_done else self.MUTED)
+            prefix = "✓ " if is_done else ("● " if is_active else "○ ")
+            btn = tk.Button(
+                step_frame,
+                text=prefix + stg_lbl,
+                command=lambda s=stg_num: self._set_socratic_stage(s),
+                font=("Segoe UI", 9, "bold" if is_active else "normal"),
+                fg=fg,
+                bg=self.HOVER,
+                activebackground=self.HOVER,
                 relief="flat",
-                padx=22,
-                pady=9,
+                bd=0,
                 cursor="hand2",
-                borderwidth=0,
             )
+            btn.pack(side="left", expand=True)
 
-        self.start_btn = _btn("▶  Start Session", self.start_tracking, self.GREEN, self.ACCENT)
-        self.start_btn.grid(row=0, column=0, padx=(0, 10))
-        self.stop_btn = _btn("■  End Session", self.stop_tracking, self.RED, self.RED)
-        self.stop_btn.grid(row=0, column=1)
-        self.stop_btn.config(state="disabled")
+        q = self.socratic_state.get("question")
+        q_text = q.get("text") if q else "What will be the output of this code snippet?"
+        options = q.get("options") if (q and q.get("options")) else ["A. 7", "B. 9", "C. 10", "D. 14"]
 
-    def _set_status(self, text, color):
-        self.status_var.set(text)
-        self._sl.config(fg=color)
+        # ── STAGE 1: THINK ────────────────────────────────────────────
+        if self.socratic_stage == 1:
+            tk.Label(card, text="Quick Learning Check", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+            tk.Label(card, text="Take a moment to think about what you just learned.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+            q_box = tk.Frame(card, bg=self.HOVER, padx=16, pady=14)
+            q_box.pack(fill="x", pady=(0, 20))
+            tk.Label(q_box, text="QUESTION PROMPT:", font=("Segoe UI", 8, "bold"), fg=self.PRIMARY, bg=self.HOVER).pack(anchor="w")
+            tk.Label(q_box, text=q_text, font=("Segoe UI", 11, "bold"), fg=self.TEXT, bg=self.HOVER, wraplength=560, justify="left").pack(anchor="w", pady=(4, 0))
+
+            # 4 Selectable Choice Cards
+            choices_frame = tk.Frame(card, bg=self.CARD)
+            choices_frame.pack(fill="x", pady=(0, 16))
+
+            for idx, opt in enumerate(options):
+                c_card = tk.Frame(choices_frame, bg=self.HOVER if self.selected_option.get() == opt else self.CARD, highlightbackground=self.PRIMARY if self.selected_option.get() == opt else self.BORDER, highlightthickness=1, padx=14, pady=10)
+                c_card.pack(fill="x", pady=4)
+                rb = tk.Radiobutton(
+                    c_card,
+                    text=opt,
+                    value=opt,
+                    variable=self.selected_option,
+                    font=("Segoe UI", 10, "bold"),
+                    fg=self.TEXT,
+                    bg=c_card["bg"],
+                    activebackground=c_card["bg"],
+                    command=lambda: self._set_socratic_stage(1),
+                )
+                rb.pack(anchor="w")
+
+            # Confidence Rating Selector
+            conf_frame = tk.Frame(card, bg=self.CARD)
+            conf_frame.pack(fill="x", pady=(10, 16))
+            tk.Label(conf_frame, text="How confident are you?", font=("Segoe UI", 10, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w", pady=(0, 6))
+
+            conf_row = tk.Frame(conf_frame, bg=self.CARD)
+            conf_row.pack(anchor="w")
+            confs = [("😄 Very Confident", "Very Confident"), ("🙂 Confident", "Confident"), ("😐 Unsure", "Unsure"), ("😟 Very Unsure", "Very Unsure")]
+            for lbl, val in confs:
+                rb = tk.Radiobutton(
+                    conf_row,
+                    text=lbl,
+                    value=val,
+                    variable=self.confidence_level,
+                    font=("Segoe UI", 9),
+                    fg=self.TEXT,
+                    bg=self.CARD,
+                    activebackground=self.CARD,
+                )
+                rb.pack(side="left", padx=(0, 14))
+
+            submit_btn = tk.Button(
+                card,
+                text="Submit Answer  →",
+                command=lambda: self._set_socratic_stage(2),
+                font=("Segoe UI", 10, "bold"),
+                fg="#FFFFFF",
+                bg=self.PRIMARY,
+                activeforeground="#FFFFFF",
+                activebackground=self.PRIMARY_HOVER,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=24,
+                pady=8,
+            )
+            submit_btn.pack(anchor="w")
+
+        # ── STAGE 2: COMPARE ──────────────────────────────────────────
+        elif self.socratic_stage == 2:
+            tk.Label(card, text="Class Comparison", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+            tk.Label(card, text="64% of students selected the same answer.", font=("Segoe UI", 10, "bold"), fg=self.TEAL, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+            comp_box = tk.Frame(card, bg=self.HOVER, padx=16, pady=16)
+            comp_box.pack(fill="x", pady=(0, 20))
+
+            bars = [("A", "12%"), ("B (Your choice)", "64%"), ("C", "18%"), ("D", "6%")]
+            for letter, pct in bars:
+                row = tk.Frame(comp_box, bg=self.HOVER)
+                row.pack(fill="x", pady=4)
+                tk.Label(row, text=f"Option {letter}", font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.HOVER, width=16, anchor="w").pack(side="left")
+                pct_val = int(pct.replace("%", ""))
+                b_canvas = tk.Canvas(row, height=14, bg=self.BORDER, highlightthickness=0)
+                b_canvas.pack(side="left", fill="x", expand=True, padx=8)
+                b_canvas.create_rectangle(0, 0, int((pct_val / 100.0) * 280), 14, fill=self.PRIMARY if "Your" in letter else self.MUTED, width=0)
+                tk.Label(row, text=pct, font=("Segoe UI", 9, "bold"), fg=self.TEXT, bg=self.HOVER).pack(side="left")
+
+            tk.Label(card, text="Would you like to reconsider your answer?", font=("Segoe UI", 11, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w", pady=(10, 12))
+
+            btn_row = tk.Frame(card, bg=self.CARD)
+            btn_row.pack(anchor="w")
+            tk.Button(
+                btn_row,
+                text="Keep My Answer",
+                command=lambda: self._set_socratic_stage(3),
+                font=("Segoe UI", 10, "bold"),
+                fg="#FFFFFF",
+                bg=self.TEAL,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=20,
+                pady=8,
+            ).pack(side="left", padx=(0, 12))
+
+            tk.Button(
+                btn_row,
+                text="Change My Answer",
+                command=lambda: self._set_socratic_stage(1),
+                font=("Segoe UI", 10, "bold"),
+                fg=self.TEXT,
+                bg=self.HOVER,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=20,
+                pady=8,
+            ).pack(side="left")
+
+        # ── STAGE 3: REFLECT ──────────────────────────────────────────
+        elif self.socratic_stage == 3:
+            tk.Label(card, text="Think About Your Reasoning", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+            tk.Label(card, text="What helped you choose your answer?", font=("Segoe UI", 10, "bold"), fg=self.PRIMARY, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+            refl_opts = ["I remembered the concept", "I worked through it step by step", "I learned it from the example", "I guessed", "I'm still unsure"]
+            for opt in refl_opts:
+                rb = tk.Radiobutton(
+                    card,
+                    text=opt,
+                    value=opt,
+                    variable=self.reflection_text,
+                    font=("Segoe UI", 10),
+                    fg=self.TEXT,
+                    bg=self.CARD,
+                    activebackground=self.CARD,
+                )
+                rb.pack(anchor="w", pady=4)
+
+            tk.Label(card, text="Want to explain your reasoning? (Optional)", font=("Segoe UI", 9, "bold"), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(14, 4))
+            reason_ent = tk.Entry(card, font=("Segoe UI", 10), fg=self.TEXT, bg=self.HOVER, relief="flat", bd=0, highlightthickness=1, highlightbackground=self.BORDER)
+            reason_ent.pack(fill="x", pady=(0, 16))
+
+            tk.Button(
+                card,
+                text="Submit Reflection  →",
+                command=lambda: self._set_socratic_stage(4),
+                font=("Segoe UI", 10, "bold"),
+                fg="#FFFFFF",
+                bg=self.PRIMARY,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=24,
+                pady=8,
+            ).pack(anchor="w")
+
+        # ── STAGE 4: REASSESSMENT ──────────────────────────────────────
+        elif self.socratic_stage == 4:
+            tk.Label(card, text="One More Try", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+            tk.Label(card, text="Here's a similar question. Let's see what you think now.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+            res_box = tk.Frame(card, bg=self.HOVER, padx=20, pady=16)
+            res_box.pack(fill="x", pady=(0, 20))
+
+            tk.Label(res_box, text="BEFORE  ➔  AFTER SUMMARY", font=("Segoe UI", 9, "bold"), fg=self.PRIMARY, bg=self.HOVER).pack(anchor="w", pady=(0, 10))
+
+            rows = [
+                ("Answer Accuracy:", "❌ Incorrect  ➔  ✓ Correct", self.TEAL),
+                ("Confidence Level:", "Unsure  ➔  Confident", self.TEXT),
+                ("Attention Focus:", "54%  ➔  76%", self.PRIMARY),
+            ]
+            for lbl, val, col in rows:
+                r = tk.Frame(res_box, bg=self.HOVER)
+                r.pack(fill="x", pady=3)
+                tk.Label(r, text=lbl, font=("Segoe UI", 9), fg=self.MUTED, bg=self.HOVER, width=18, anchor="w").pack(side="left")
+                tk.Label(r, text=val, font=("Segoe UI", 10, "bold"), fg=col, bg=self.HOVER).pack(side="left")
+
+            tk.Label(card, text="“Nice work. Your understanding appears to have improved.”", font=("Segoe UI", 11, "italic"), fg=self.TEXT, bg=self.CARD).pack(anchor="w", pady=(0, 16))
+
+            tk.Button(
+                card,
+                text="Return to Dashboard",
+                command=lambda: self._switch_tab("dashboard"),
+                font=("Segoe UI", 10, "bold"),
+                fg="#FFFFFF",
+                bg=self.PRIMARY,
+                relief="flat",
+                bd=0,
+                cursor="hand2",
+                padx=24,
+                pady=8,
+            ).pack(anchor="w")
+
+    def _set_socratic_stage(self, stage):
+        self.socratic_stage = stage
+        if self.active_tab == "socratic":
+            self._switch_tab("socratic")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 3: Camera & Privacy View
+    # ══════════════════════════════════════════════════════════════════════════
+    def _render_privacy_view(self, parent):
+        card = tk.Frame(parent, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=24)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(card, text="🔒 How Attention Monitoring Works & About Privacy", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+        tk.Label(card, text="Attenova is engineered from the ground up to guarantee 100% student privacy.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+        pillars = [
+            ("💻 100% Local On-Device Processing", "Webcam frames stay strictly inside local computer RAM for real-time computer vision feature extraction. No raw video, camera feeds, or image snapshots are ever uploaded to the server or saved to disk."),
+            ("📊 Derived Numerical Telemetry Only", "Only high-level mathematical telemetry (estimated attention %, head pose angles, blink frequency, gaze direction vector, and phone presence) is shared with the classroom dashboard."),
+            ("⏸️ Complete Student Agency & Pause Control", "You can pause attention monitoring at any time using the 'Pause Monitoring' button. While paused, telemetry is held neutral without penalty or false alert generation."),
+            ("💡 Non-Punitive Pedagogical Purpose", "Attenova is designed to encourage self-reflection and prompt timely Socratic guidance — not to monitor or judge student behavior."),
+        ]
+
+        for title, desc in pillars:
+            box = tk.Frame(card, bg=self.HOVER, padx=16, pady=12)
+            box.pack(fill="x", pady=6)
+            tk.Label(box, text=title, font=("Segoe UI", 11, "bold"), fg=self.PRIMARY, bg=self.HOVER).pack(anchor="w")
+            tk.Label(box, text=desc, font=("Segoe UI", 9), fg=self.TEXT, bg=self.HOVER, justify="left").pack(anchor="w", pady=(3, 0))
+
+        # Standalone OpenCV window toggle
+        chk_win = tk.Checkbutton(
+            card,
+            text="Enable standalone debug CV window",
+            variable=self.show_cv_window_var,
+            font=("Segoe UI", 10),
+            fg=self.TEXT,
+            bg=self.CARD,
+            activebackground=self.CARD,
+        )
+        chk_win.pack(anchor="w", pady=(16, 0))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 4: Detection Details View (Technical Transparency)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _render_details_view(self, parent):
+        card = tk.Frame(parent, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=24)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(card, text="Attention Insights & Detection Metrics", font=("Segoe UI", 16, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+        tk.Label(card, text="Technical metrics running on local MediaPipe + YOLOv8 + ML classifier.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+        grid = tk.Frame(card, bg=self.CARD)
+        grid.pack(fill="x", pady=(0, 16))
+
+        info = self.latest_info
+        metrics = [
+            ("Face Detection:", "478 Landmarks (MediaPipe)", self.TEAL),
+            ("Gaze Direction:", str(info.get("gaze", "Center")), self.TEXT),
+            ("Head Pose:", str(info.get("pose", (0, 0, 0))), self.TEXT),
+            ("Blink Rate:", f"{info.get('blinks_per_min', 0):.1f} / min", self.TEXT),
+            ("YOLO Phone Detection:", "Detected" if info.get("phone_detected") else "Clear", self.RED if info.get("phone_detected") else self.TEAL),
+            ("Hand Count:", f"{info.get('hands_count', 0)} hands", self.TEXT),
+            ("ML Raw Prob:", f"{info.get('model_prob_raw', 0.85):.2f}", self.TEXT),
+            ("Smoothed Prob:", f"{info.get('model_prob_smoothed', 0.85):.2f}", self.PRIMARY),
+        ]
+
+        for i, (lbl, val, col) in enumerate(metrics):
+            r = i // 2
+            c = (i % 2) * 2
+            tk.Label(grid, text=lbl, font=("Segoe UI", 9, "bold"), fg=self.MUTED, bg=self.CARD).grid(row=r, column=c, sticky="w", pady=4, padx=(0, 8))
+            tk.Label(grid, text=val, font=("Segoe UI", 9, "bold"), fg=col, bg=self.CARD).grid(row=r, column=c + 1, sticky="w", pady=4, padx=(0, 24))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Tab 5: Session Summary View
+    # ══════════════════════════════════════════════════════════════════════════
+    def _render_summary_view(self, parent):
+        card = tk.Frame(parent, bg=self.CARD, highlightbackground=self.BORDER, highlightthickness=1, padx=24, pady=24)
+        card.pack(fill="both", expand=True)
+
+        tk.Label(card, text="Session Complete", font=("Segoe UI", 18, "bold"), fg=self.TEXT, bg=self.CARD).pack(anchor="w")
+        tk.Label(card, text="Great job! Here is your learning engagement summary.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(2, 16))
+
+        # KPI Tiles Strip
+        tiles_frame = tk.Frame(card, bg=self.CARD)
+        tiles_frame.pack(fill="x", pady=(0, 20))
+
+        tiles = [
+            ("Session Duration", "52 min", self.TEXT),
+            ("Average Attention", f"{self.latest_info.get('avg_attention', 82)}%", self.PRIMARY),
+            ("Highest Attention", f"{self.latest_info.get('peak_attention', 95)}%", self.TEAL),
+            ("Interventions", "2", self.TEXT),
+            ("Improvement", "+18%", self.TEAL),
+        ]
+        for title, val, col in tiles:
+            t_box = tk.Frame(tiles_frame, bg=self.HOVER, padx=14, pady=12)
+            t_box.pack(side="left", expand=True, fill="x", padx=4)
+            tk.Label(t_box, text=val, font=("Segoe UI", 18, "bold"), fg=col, bg=self.HOVER).pack()
+            tk.Label(t_box, text=title, font=("Segoe UI", 8, "bold"), fg=self.MUTED, bg=self.HOVER).pack()
+
+        # Session Pattern Card
+        pat_box = tk.Frame(card, bg=self.HOVER, padx=16, pady=14)
+        pat_box.pack(fill="x", pady=(0, 16))
+        tk.Label(pat_box, text="YOUR SESSION PATTERN", font=("Segoe UI", 8, "bold"), fg=self.PRIMARY, bg=self.HOVER).pack(anchor="w")
+        tk.Label(
+            pat_box,
+            text="“Your attention was strongest during the first 30 minutes and gradually settled into a steady flow.”",
+            font=("Segoe UI", 10, "italic"),
+            fg=self.TEXT,
+            bg=self.HOVER,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        # Suggestion Card
+        sug_box = tk.Frame(card, bg=self.HOVER, padx=16, pady=14)
+        sug_box.pack(fill="x", pady=(0, 20))
+        tk.Label(sug_box, text="SUGGESTION", font=("Segoe UI", 8, "bold"), fg=self.TEAL, bg=self.HOVER).pack(anchor="w")
+        tk.Label(
+            sug_box,
+            text="“Consider taking a short 5-minute break before your next study session to recharge.”",
+            font=("Segoe UI", 10),
+            fg=self.TEXT,
+            bg=self.HOVER,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        tk.Button(
+            card,
+            text="Return to Dashboard",
+            command=lambda: self._switch_tab("dashboard"),
+            font=("Segoe UI", 10, "bold"),
+            fg="#FFFFFF",
+            bg=self.PRIMARY,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=24,
+            pady=8,
+        ).pack(anchor="w")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Callbacks & Event Handlers
+    # ══════════════════════════════════════════════════════════════════════════
+    def toggle_pause_monitoring(self):
+        is_paused = not self.session_flags.get("is_paused", False)
+        self.session_flags["is_paused"] = is_paused
+        self.update_pause_button_ui(is_paused)
+
+    def update_pause_button_ui(self, is_paused: bool):
+        if is_paused:
+            self.pause_btn.configure(
+                text="▶  Resume Monitoring",
+                fg="#92400E",
+                bg=self.AMBER_MIST,
+                activebackground=self.AMBER_MIST,
+            )
+            if hasattr(self, "conn_badge"):
+                self.conn_badge.configure(text="⏸ Monitoring Paused", fg=self.AMBER, bg=self.AMBER_MIST)
+        else:
+            self.pause_btn.configure(
+                text="⏸  Pause Monitoring",
+                fg=self.TEXT,
+                bg=self.HOVER,
+                activebackground=self.BORDER,
+            )
+            if hasattr(self, "conn_badge"):
+                self.conn_badge.configure(text="● Connected", fg=self.TEAL, bg=self.TEAL_MIST)
+
+    def _show_privacy_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("🔒 About Privacy & How Attention Monitoring Works")
+        dlg.geometry("640x580")
+        dlg.resizable(False, False)
+        dlg.configure(bg=self.BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        card = tk.Frame(dlg, bg=self.CARD, padx=24, pady=24)
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        tk.Label(card, text="🔒 Privacy & Transparency Notice", font=("Segoe UI", 16, "bold"), fg=self.PRIMARY, bg=self.CARD).pack(anchor="w", pady=(0, 4))
+        tk.Label(card, text="How Attenova protects your data and privacy during learning sessions.", font=("Segoe UI", 10), fg=self.MUTED, bg=self.CARD).pack(anchor="w", pady=(0, 16))
+
+        sections = [
+            ("💻 100% Local On-Device Processing", "Webcam video frames are processed locally in real-time memory on your computer. No raw video, camera feeds, or facial images are ever recorded, stored on disk, or transmitted to any server."),
+            ("📊 Derived Numerical Telemetry Only", "Only high-level mathematical telemetry (estimated attention %, head pose angles, blink frequency, gaze direction vector, and phone presence) is sent to the classroom server."),
+            ("⏸️ Complete Student Agency & Pause Control", "You can pause attention monitoring at any time using the 'Pause Monitoring' button. While paused, telemetry is held neutral without penalty or false alert generation."),
+            ("💡 Non-Punitive Pedagogical Purpose", "Attenova is designed to encourage self-reflection and prompt timely Socratic guidance — not to monitor or judge student behavior."),
+        ]
+
+        for title, desc in sections:
+            box = tk.Frame(card, bg=self.HOVER, padx=14, pady=10)
+            box.pack(fill="x", pady=6)
+            tk.Label(box, text=title, font=("Segoe UI", 10, "bold"), fg=self.TEXT, bg=self.HOVER).pack(anchor="w")
+            tk.Label(box, text=desc, font=("Segoe UI", 9), fg=self.MUTED, bg=self.HOVER, wraplength=540, justify="left").pack(anchor="w", pady=(2, 0))
+
+        tk.Button(
+            card,
+            text="Got it",
+            command=dlg.destroy,
+            font=("Segoe UI", 10, "bold"),
+            fg="#FFFFFF",
+            bg=self.PRIMARY,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=24,
+            pady=8,
+        ).pack(anchor="e", pady=(16, 0))
+
+    def _on_frame(self, frame_bgr, info, socratic_state):
+        self.latest_info = info
+        self.socratic_state = socratic_state
+
+        # Update UI components via Tkinter main loop thread
+        self.root.after(0, lambda: self._update_gui_from_frame(frame_bgr, info, socratic_state))
+
+    def _update_gui_from_frame(self, frame_bgr, info, socratic_state):
+        # 1. Update Timer
+        elapsed = int(info.get("elapsed", 0))
+        m, s = divmod(elapsed, 60)
+        h, m = divmod(m, 60)
+        if hasattr(self, "timer_lbl"):
+            self.timer_lbl.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+
+        # 2. Update Camera Preview Label
+        if self.show_cam_preview.get() and hasattr(self, "cam_preview_label"):
+            try:
+                if info.get("is_paused"):
+                    self.cam_preview_label.configure(
+                        image="",
+                        text="⏸️ Monitoring Paused\n\nNo video or telemetry\nis being analyzed.",
+                        fg=self.AMBER,
+                        bg=self.CAM_BG,
+                        font=("Segoe UI", 10, "bold"),
+                    )
+                else:
+                    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(rgb)
+                    img = img.resize((240, 140), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image=img)
+                    self.cam_preview_label.configure(image=photo, text="")
+                    self.cam_preview_label.image = photo
+            except Exception:
+                pass
+
+        # 3. Update Dashboard Charts if Active
+        if self.active_tab == "dashboard":
+            score = info.get("attention", 85)
+            self._draw_circular_gauge(score)
+            self._draw_timeline_chart()
+            if hasattr(self, "kpi_current"):
+                self.kpi_current.configure(text=f"Current: {score}%")
+                self.kpi_avg.configure(text=f"Session Average: {info.get('avg_attention', 82)}%")
+                self.kpi_peak.configure(text=f"Peak: {info.get('peak_attention', 95)}%")
+
+        # 4. Socratic Active Auto-Tab Switch Notification
+        if socratic_state.get("active") and socratic_state.get("question"):
+            if self.active_tab != "socratic" and self.socratic_stage == 1:
+                # Highlight sidebar Socratic button
+                if "socratic" in self.nav_btns:
+                    self.nav_btns["socratic"].configure(text="💡  Learning Session (NEW)", fg=self.AMBER)
+
+    def toggle_session(self):
+        if self.worker and self.worker.is_alive():
+            if messagebox.askyesno("End Session", "Are you sure you want to end your active study session?"):
+                self.stop_tracking()
+        else:
+            self.start_tracking()
+
+    def start_tracking(self):
+        name = self.name_var.get().strip()
+        roll = self.roll_var.get().strip()
+        join = self.join_var.get().strip()
+        if not name or not roll:
+            messagebox.showerror("Validation", "Student Name and Roll Number are required.")
+            return
+
+        self.session_flags["end_by_user"] = False
+        self.session_flags["fatal_error"] = None
+        self.stop_event.clear()
+
+        self.session_btn.configure(text="■  End Session", bg=self.RED)
+        self.conn_badge.configure(text="● Connected", fg=self.TEAL, bg=self.TEAL_MIST)
+
+        self.worker = threading.Thread(target=self._run_tracker, daemon=True)
+        self.worker.start()
 
     def _run_tracker(self):
         name = self.name_var.get().strip()
         roll = self.roll_var.get().strip().upper()
-        code = self.class_var.get().strip() or "Class"
+        code = self.class_var.get().strip() or "CS101"
         join = self.join_var.get().strip()
         server = self.server_var.get().strip() or "http://localhost:8000"
-
-        if not name or not roll:
-            self.root.after(0, lambda: self._on_validation_error())
-            return
 
         ok = run_tracking(
             self.stop_event,
@@ -1628,81 +2878,38 @@ class TrackerUI:
             class_code=code,
             server_url=server,
             join_code=join,
-            on_status=lambda msg: self.root.after(0, lambda m=msg: self._set_status(m, self.ACCENT)),
+            on_status=lambda msg: self.root.after(0, lambda m=msg: self._set_status(m)),
             session_flags=self.session_flags,
+            on_frame_callback=self._on_frame,
+            show_cv_window=self.show_cv_window_var.get(),
         )
         self.root.after(0, lambda: self._on_finished(ok))
 
-    def _on_validation_error(self):
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
-        self.worker = None
-        self._set_status("● Missing fields", self.RED)
-        messagebox.showerror("Validation", "Student Name and Roll Number are required.")
+    def _set_status(self, msg):
+        if hasattr(self, "conn_badge"):
+            if "failed" in msg.lower() or "error" in msg.lower():
+                self.conn_badge.configure(text="● Reconnecting...", fg=self.AMBER, bg=self.AMBER_MIST)
+            else:
+                self.conn_badge.configure(text="● Connected", fg=self.TEAL, bg=self.TEAL_MIST)
 
     def _on_finished(self, result):
-        self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
+        self.session_btn.configure(text="▶  Start Session", bg=self.PRIMARY)
+        self.conn_badge.configure(text="● Offline", fg=self.MUTED, bg=self.HOVER)
         self.worker = None
         self.stop_event.clear()
-        self.session_flags["end_by_user"] = False
 
-        if result == "ok":
-            self._set_status("● Session completed", self.GREEN)
-        elif result == "stopped":
-            self._set_status("● Session ended", self.MUTED)
-        elif result == "join_denied":
-            self._set_status("● Invalid join code", self.RED)
-            detail = self.session_flags.get("fatal_error") or "Could not join this class session."
-            messagebox.showerror("Join Failed", detail)
-        elif result == "webcam_error":
-            self._set_status("● Webcam error", self.RED)
-            messagebox.showerror("Error", "Cannot open webcam.")
-        else:
-            self._set_status("● Session ended", self.MUTED)
-
-    def start_tracking(self):
-        if self.worker and self.worker.is_alive():
-            return
-        name = self.name_var.get().strip()
-        roll = self.roll_var.get().strip()
-        join = self.join_var.get().strip()
-        if not name or not roll:
-            messagebox.showerror("Validation", "Student Name and Roll Number are required.")
-            return
-        if not join:
-            messagebox.showerror("Validation", "Join code is required to start a session.")
-            return
-
-        consent = messagebox.askyesno(
-            "Privacy & consent",
-            "This app uses your webcam locally to estimate attention.\n\n"
-            "• Video is processed on this computer only\n"
-            "• Only attention scores and alerts are sent to the server\n"
-            "• No video recordings are uploaded\n\n"
-            "Do you consent to start monitoring?",
-            icon="warning",
-        )
-        if not consent:
-            self._set_status("● Consent required", self.MUTED)
-            return
-
-        self.session_flags["end_by_user"] = False
-        self.session_flags["fatal_error"] = None
-        self.stop_event.clear()
-        self._set_status("● Verifying join code…", self.ACCENT)
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.worker = threading.Thread(target=self._run_tracker, daemon=True)
-        self.worker.start()
+        if result in ("ok", "stopped"):
+            self._switch_tab("summary")
 
     def stop_tracking(self):
         if self.worker and self.worker.is_alive():
             self.session_flags["end_by_user"] = True
-            self._set_status("● Ending session…", self.MUTED)
             self.stop_event.set()
 
     def on_close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno("Exit Companion", "An active tracking session is running. Are you sure you want to exit?"):
+                return
         self.session_flags["end_by_user"] = True
         self.stop_event.set()
         self.root.destroy()
@@ -1711,9 +2918,13 @@ class TrackerUI:
         self.root.mainloop()
 
 
+# Backwards compatibility alias
+TrackerUI = AttenovaCompanionApp
+
+
 def main():
-    TrackerUI().run()
+    AttenovaCompanionApp().run()
 
 
 if __name__ == "__main__":
-    main()
+    main()

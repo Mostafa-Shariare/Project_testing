@@ -23,17 +23,19 @@ PIPE_H = 88
 CANVAS_W = VIDEO_W + PANEL_W
 CANVAS_H = HEADER_H + VIDEO_H + TIMELINE_H + PIPE_H + FOOTER_H + 16
 
-# Light theme — BGR
-C_BG = (252, 250, 248)
-C_SURFACE = (255, 255, 255)
-C_BORDER = (240, 232, 226)
-C_TEXT = (42, 23, 15)
-C_MUTED = (139, 116, 100)
-C_PRIMARY = (235, 99, 37)
-C_GREEN = (74, 163, 22)
-C_BLUE = (235, 99, 37)
-C_ORANGE = (12, 88, 234)
-C_RED = (38, 38, 220)
+# Warm Academic Horizon — BGR Color Palette (Attenova Design System)
+C_BG = (245, 248, 255)       # #FFF8F5 (Warm Paper Linen)
+C_SURFACE = (255, 255, 255)  # #FFFFFF (Pure Chalk White)
+C_BORDER = (224, 230, 240)   # #F0E6E0 (Soft Beige Divider)
+C_TEXT = (23, 27, 31)        # #1F1B17 (Espresso Charcoal)
+C_MUTED = (100, 116, 133)    # #857464 (Warm Earth Gray)
+C_PRIMARY = (61, 155, 232)   # #E89B3D (Warm Amber)
+C_SECONDARY = (96, 184, 244) # #F4B860 (Golden Honey)
+C_TERTIARY = (74, 108, 217)  # #D96C4A (Terracotta Clay)
+C_GREEN = (40, 104, 62)      # #3E6828 (Academic Sage Green)
+C_BLUE = (61, 155, 232)      # #E89B3D
+C_ORANGE = (74, 108, 217)    # #D96C4A
+C_RED = (74, 108, 217)       # #D96C4A (Terracotta Red)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_B = cv2.FONT_HERSHEY_DUPLEX
@@ -43,10 +45,10 @@ def score_band_color(score: int) -> tuple:
     if score >= 90:
         return C_GREEN
     if score >= 70:
-        return C_BLUE
+        return C_PRIMARY
     if score >= 50:
-        return C_ORANGE
-    return C_RED
+        return C_SECONDARY
+    return C_TERTIARY
 
 
 def focus_label(score: int, face_ok: bool) -> str:
@@ -57,8 +59,8 @@ def focus_label(score: int, face_ok: bool) -> str:
     if score >= 70:
         return "Good Focus"
     if score >= 50:
-        return "Moderate"
-    return "Distracted"
+        return "Moderate Focus"
+    return "Rest Needed"
 
 
 def _fill_round_rect(img, x1, y1, x2, y2, color, alpha=1.0):
@@ -121,13 +123,13 @@ def _ai_summaries(info: dict) -> list[str]:
         lines.append("Gaze direction unavailable")
 
     if info.get("phone_detected"):
-        lines.append("Phone detected - distraction risk")
+        lines.append("Hand activity or device observed")
     else:
         lines.append("No phone detected")
 
     alert = info.get("alert", "")
-    if alert == "SUSTAINED DISTRACTION":
-        lines.append("Attention declining - sustained distraction")
+    if alert == "SUSTAINED DISTRACTION" or "drift" in alert.lower():
+        lines.append("Sustained attention drift detected")
     elif alert:
         lines.append(f"Alert active: {alert}")
     else:
@@ -135,9 +137,9 @@ def _ai_summaries(info: dict) -> list[str]:
         if attn >= 70:
             lines.append("Stable attention maintained")
         elif attn >= 50:
-            lines.append("Attention fluctuating")
+            lines.append("Attention pattern shifting")
         else:
-            lines.append("Low attention - refocus recommended")
+            lines.append("Attention drifting - refocus break recommended")
     return lines[:4]
 
 
@@ -250,6 +252,35 @@ def draw_head_pose_markers(frame, landmarks, w, h):
             cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 5, col, -1, cv2.LINE_AA)
 
 
+def _draw_socratic_banner(img, x, y, w, info: dict):
+    q = info.get("socratic_question")
+    session_active = info.get("socratic_active")
+    if not session_active and not q:
+        return
+    
+    bh = 60
+    _fill_round_rect(img, x, y, x + w, y + bh, (235, 242, 252), alpha=0.96)
+    cv2.rectangle(img, (x, y), (x + w, y + bh), C_PRIMARY, 2)
+    
+    _fill_round_rect(img, x + 10, y + 10, x + 40, y + 40, C_PRIMARY)
+    _text(img, "!", x + 21, y + 32, scale=0.65, color=(255, 255, 255), bold=True)
+    
+    if q:
+        qtext = str(q.get("text", ""))[:65]
+        qtype = str(q.get("question_type", "short")).upper()
+        _text(img, f"SOCRATIC PROMPT [{qtype}]", x + 48, y + 24, scale=0.40, color=C_PRIMARY, bold=True)
+        _text(img, qtext, x + 48, y + 44, scale=0.40, color=C_TEXT)
+        
+        ans_state = info.get("socratic_answer_status", "")
+        if ans_state:
+            _badge(img, x + w - 160, y + 14, f"Status: {ans_state}", C_GREEN)
+        elif qtype == "MCQ":
+            _text(img, "[Press 1-4 for Opt A-D]", x + w - 190, y + 38, scale=0.36, color=C_TERTIARY, bold=True)
+    else:
+        _text(img, "SOCRATIC SESSION ACTIVE", x + 48, y + 26, scale=0.42, color=C_PRIMARY, bold=True)
+        _text(img, "Teacher launched session - waiting for question...", x + 48, y + 44, scale=0.36, color=C_MUTED)
+
+
 class AnalysisConsole:
     """Builds the composite AI vision console frame each tick."""
 
@@ -271,8 +302,8 @@ class AnalysisConsole:
         # ── Top header bar ─────────────────────────────────────────────
         _fill_round_rect(canvas, 0, 0, CANVAS_W, 40, C_SURFACE)
         cv2.line(canvas, (0, 40), (CANVAS_W, 40), C_BORDER, 1)
-        _text(canvas, "AttentionAI", 16, 28, scale=0.52, color=C_PRIMARY, bold=True)
-        _text(canvas, "Vision Analysis Console", 118, 28, scale=0.44, color=C_TEXT)
+        _text(canvas, "Visoria AI", 16, 28, scale=0.52, color=C_PRIMARY, bold=True)
+        _text(canvas, "Student App & CV Pipeline", 118, 28, scale=0.44, color=C_TEXT)
         _text(
             canvas,
             self._session_str(info),
@@ -291,6 +322,10 @@ class AnalysisConsole:
         vy = content_top + 8
         canvas[vy : vy + vid.shape[0], 16 : 16 + vid.shape[1]] = vid
         _text(canvas, "Live Vision Feed", 20, vy + 20, scale=0.42, color=C_MUTED)
+
+        # Socratic Notification Banner overlay
+        if info.get("socratic_active") or info.get("socratic_question"):
+            _draw_socratic_banner(canvas, 24, vy + 30, VIDEO_W - 48, info)
 
         # ── Right analytics panel ────────────────────────────────────
         px = VIDEO_W

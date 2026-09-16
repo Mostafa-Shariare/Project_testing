@@ -1,7 +1,11 @@
 """
 attention_model.py
 ==================
-Drop-in model interface for the Attention Detection pipeline.
+Multi-Feature Behavioral Attention Estimation Model Interface.
+
+Treats student attention as an estimated multi-signal behavioral state
+derived from feature fusion (gaze, head pose, blink rate, hand count, phone detection)
+rather than a direct binary screen-gaze measurement.
 
 Public API:
     predict_attention(input_features: dict) -> int

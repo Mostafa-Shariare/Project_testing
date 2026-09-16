@@ -1,0 +1,21 @@
+{
+  "name": "visoria-electron-tracker",
+  "version": "1.0.0",
+  "description": "Visoria Desktop Student Tracker — Electron Edition",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "keywords": [
+    "visoria",
+    "attention-tracker",
+    "electron",
+    "student-companion"
+  ],
+  "author": "Visoria",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.2.1"
+  }
+}

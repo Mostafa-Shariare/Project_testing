@@ -8,8 +8,9 @@ export function getAttentionBand(score) {
   return 'low';
 }
 
-export function getFocusLabel(score, isOffline) {
+export function getFocusLabel(score, isOffline, isPaused = false) {
   if (isOffline) return 'Offline';
+  if (isPaused) return '⏸️ Paused';
   const band = getAttentionBand(score);
   switch (band) {
     case 'excellent':
@@ -19,7 +20,7 @@ export function getFocusLabel(score, isOffline) {
     case 'moderate':
       return 'Moderate Attention';
     case 'low':
-      return 'Distracted';
+      return 'Attention Drift';
     default:
       return 'Unknown';
   }
@@ -30,6 +31,7 @@ export const BAND_COLORS = {
   good: { main: '#2563EB', bg: '#DBEAFE', border: '#93C5FD' },
   moderate: { main: '#EA580C', bg: '#FFEDD5', border: '#FDBA74' },
   low: { main: '#DC2626', bg: '#FEE2E2', border: '#FCA5A5' },
+  paused: { main: '#D97706', bg: '#FEF3C7', border: '#FDE68A' },
   offline: { main: '#64748B', bg: '#F1F5F9', border: '#CBD5E1' },
 };
 

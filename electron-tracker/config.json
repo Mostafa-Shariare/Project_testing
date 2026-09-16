@@ -1,0 +1,7 @@
+{
+  "student_name": "John Doe",
+  "roll_number": "ROLL001",
+  "class_code": "CS233",
+  "join_code": "B29078",
+  "server_url": "http://localhost:8000"
+}

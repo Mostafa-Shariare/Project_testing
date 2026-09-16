@@ -1,23 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { MoreVertical } from 'lucide-react';
-import {
-  avatarInitials,
-  BAND_COLORS,
-  getAttentionBand,
-  getFocusLabel,
-} from '../utils/attentionTheme';
+import { avatarInitials } from '../utils/attentionTheme';
 import { isBelowThreshold, studentCardId } from '../utils/liveMonitorUtils';
-import StudentSparkline from './StudentSparkline';
 import StudentCardMenu from './StudentCardMenu';
-
-function computeTrend(sparkline) {
-  if (!sparkline || sparkline.length < 2) return 'flat';
-  const a = sparkline[sparkline.length - 2];
-  const b = sparkline[sparkline.length - 1];
-  if (b > a + 2) return 'up';
-  if (b < a - 2) return 'down';
-  return 'flat';
-}
 
 export default function StudentCard({
   student,
@@ -32,21 +17,50 @@ export default function StudentCard({
 }) {
   const cardRef = useRef(null);
   const [menuPos, setMenuPos] = useState(null);
+  const [actionFeedback, setActionFeedback] = useState(null);
 
   const isOffline = student.status === 'offline';
+  const isPaused = student.status === 'paused' || student.is_paused;
   const score = student.attention ?? 0;
-  const band = isOffline ? 'offline' : getAttentionBand(score);
-  const colors = BAND_COLORS[band];
   const alert = student.alert || '';
-  const excused = actionState.excused;
-  const suppressed = actionState.suppress_alerts;
-  const belowThreshold = !isOffline && isBelowThreshold(student, attentionThreshold);
+  const isSocratic = student.socratic_state || student.in_socratic || (alert && alert.toLowerCase().includes('socratic'));
+  const isCritical = !isOffline && (score < 50 || alert.toLowerCase().includes('critical') || alert.toLowerCase().includes('below threshold'));
+  const isDrift = !isOffline && !isCritical && (score < 75 || alert.toLowerCase().includes('drift') || alert.toLowerCase().includes('unfocused') || alert.toLowerCase().includes('phone') || alert.toLowerCase().includes('tab switch') || alert.toLowerCase().includes('gaze'));
+  const isNominal = !isOffline && !isCritical && !isDrift;
 
-  const hasAlert =
-    alert && alert !== 'LEFT SESSION' && alert !== 'DISCONNECTED' && !suppressed;
+  // Status color scheme & styling
+  let statusType = 'emerald';
+  let statusLabel = student.status_label || 'Flow State';
+  let avatarClass = '';
+  let borderClass = '';
 
-  const trend = computeTrend(sparkline);
-  const trendSymbol = trend === 'up' ? '\u2191' : trend === 'down' ? '\u2193' : '\u2192';
+  if (isOffline) {
+    statusType = 'offline';
+    statusLabel = 'Disconnected';
+  } else if (isCritical) {
+    statusType = 'error';
+    statusLabel = alert || 'Critical Alert';
+    avatarClass = 'avatar-error';
+    borderClass = 'border-error';
+  } else if (isDrift) {
+    statusType = 'amber';
+    statusLabel = alert || 'Window Unfocused';
+    avatarClass = 'avatar-drift';
+  } else if (isSocratic) {
+    statusType = 'violet';
+    statusLabel = student.socratic_step ? `Socratic Step ${student.socratic_step}` : 'In Socratic Dialogue';
+  }
+
+  // Radial Gauge Calculations
+  const radius = 14;
+  const circumference = 2 * Math.PI * radius; // ~88
+  const clampedScore = Math.max(0, Math.min(100, score));
+  const strokeDashoffset = circumference - (circumference * clampedScore) / 100;
+  const gaugeColor = isOffline ? '#86948a' : isCritical ? '#ffb4ab' : isDrift ? '#ffb95f' : '#4edea3';
+
+  // Task / execution module title
+  const currentTask = student.current_task || student.task || (isCritical ? 'Comprehension below 50%' : isDrift ? 'Dynamic Programming Knapsack' : 'Recursion Tree Trace & Proof');
+  const taskHeader = isCritical ? 'Syntax Faults' : 'Current Task';
 
   const openMenu = (e) => {
     e.preventDefault();
@@ -76,6 +90,16 @@ export default function StudentCard({
     await onRunAction?.(student, action);
   };
 
+  const handleQuickAction = (e, label) => {
+    e.stopPropagation();
+    setActionFeedback('Dispatched');
+    setTimeout(() => {
+      setActionFeedback('In Flight');
+      setTimeout(() => setActionFeedback(null), 1800);
+    }, 600);
+    onRunAction?.(student, label);
+  };
+
   useEffect(() => {
     if (!menuPos) return;
     const close = () => setMenuPos(null);
@@ -90,72 +114,98 @@ export default function StudentCard({
         id={studentCardId(student.roll_number)}
         role="button"
         tabIndex={0}
-        className={[
-          'student-card',
-          'student-card-clickable',
-          `band-${band}`,
-          highlighted ? 'card-highlight' : '',
-          alertFlashing ? 'card-alert-flash' : '',
-          excused ? 'card-excused' : '',
-          belowThreshold ? 'card-below-threshold' : '',
-        ]
-          .filter(Boolean)
-          .join(' ')}
-        data-roll={student.roll_number}
+        className={`telemetry-card ${borderClass} ${highlighted ? 'card-highlight' : ''}`}
         onClick={() => onClick?.(student)}
         onContextMenu={openMenu}
         onKeyDown={(e) => e.key === 'Enter' && onClick?.(student)}
       >
-        <div className="card-top">
-          <div className="student-identity-row">
-            <div
-              className="student-avatar"
-              style={{ background: colors.bg, color: colors.main, border: `2px solid ${colors.border}` }}
-            >
+        {/* Card Top: Identity + Status + Radial Gauge */}
+        <div className="telemetry-card-top">
+          <div className="telemetry-identity">
+            <div className={`telemetry-avatar ${avatarClass}`}>
               {avatarInitials(student.name)}
             </div>
-            <div className="student-identity-text">
-              <div className="student-name" title={student.name}>
+            <div className="telemetry-identity-meta">
+              <div className="telemetry-student-name" title={student.name}>
                 {student.name}
               </div>
-              <div className="student-roll">
-                {student.roll_number}
-                {excused && <span className="excused-tag"> \u00b7 Excused</span>}
-              </div>
+              <span className={`telemetry-status-chip ${statusType}`}>
+                <span className="dot" />
+                {statusLabel}
+              </span>
             </div>
           </div>
-          <div className="card-top-actions">
-            <span className={`focus-badge ${band}`}>{getFocusLabel(score, isOffline)}</span>
-            <button type="button" className="card-menu-btn" aria-label="Actions" onClick={openMenu}>
-              <MoreVertical size={16} />
+
+          <div className="telemetry-gauge-wrap">
+            <svg className="telemetry-gauge-svg" viewBox="0 0 36 36">
+              <circle
+                cx="18"
+                cy="18"
+                r={radius}
+                fill="none"
+                stroke="#31353c"
+                strokeWidth="3"
+              />
+              <circle
+                cx="18"
+                cy="18"
+                r={radius}
+                fill="none"
+                stroke={gaugeColor}
+                strokeWidth="3"
+                strokeDasharray={circumference}
+                strokeDashoffset={isOffline ? circumference : strokeDashoffset}
+                strokeLinecap="round"
+              />
+            </svg>
+            <span className={`telemetry-gauge-val ${statusType}`}>
+              {isOffline ? '—' : score}
+            </span>
+          </div>
+        </div>
+
+        {/* Card Middle: Current Task or Alert Fault */}
+        <div className="telemetry-card-mid">
+          <div className={`telemetry-task-header ${isCritical ? 'error' : ''}`}>
+            {taskHeader}
+          </div>
+          <div className="telemetry-task-desc" title={currentTask}>
+            {currentTask}
+          </div>
+        </div>
+
+        {/* Card Bottom: Sync / Idle status + Action Button or Status Tag */}
+        <div className="telemetry-card-bottom">
+          <span className="telemetry-sync-time">
+            {isOffline ? 'Offline' : student.last_synced || 'Synced 2s ago'}
+          </span>
+
+          {actionFeedback ? (
+            <span className="telemetry-action-tag violet" style={{ display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+              ✓ {actionFeedback}
+            </span>
+          ) : isCritical ? (
+            <button
+              type="button"
+              className="telemetry-card-action-btn violet"
+              onClick={(e) => handleQuickAction(e, 'deconstruct')}
+            >
+              Deconstruct
             </button>
-          </div>
+          ) : isDrift ? (
+            <button
+              type="button"
+              className="telemetry-card-action-btn violet"
+              onClick={(e) => handleQuickAction(e, 'socratic_nudge')}
+            >
+              Socratic Nudge
+            </button>
+          ) : isSocratic ? (
+            <span className="telemetry-action-tag violet">Responding</span>
+          ) : (
+            <span className="telemetry-action-tag emerald">Nominal</span>
+          )}
         </div>
-
-        <div className="card-score-row">
-          <div
-            className="attention-ring"
-            style={{
-              background: `conic-gradient(${colors.main} ${isOffline ? '0%' : `${score}%`}, ${colors.bg} 0)`,
-            }}
-          >
-            <div className="attention-ring-inner">
-              {isOffline ? '\u2014' : `${score}%`}
-            </div>
-            {!isOffline && <span className={`attention-trend trend-${trend}`}>{trendSymbol}</span>}
-          </div>
-          <div className="sparkline-wrap">
-            <div className="sparkline-label">Last {sparkline.length} readings</div>
-            <StudentSparkline data={sparkline} width={120} height={32} color={colors.main} />
-          </div>
-        </div>
-
-        {hasAlert && (
-          <div className="card-alert-banner has-alert">
-            <span className="alert-banner-dot" />
-            {alert}
-          </div>
-        )}
       </div>
 
       {menuPos && (
@@ -170,3 +220,4 @@ export default function StudentCard({
     </>
   );
 }
+

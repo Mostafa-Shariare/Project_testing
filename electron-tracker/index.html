@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Visoria Student Desktop Tracker</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header Bar -->
+    <header class="header-bar">
+      <div class="brand-group">
+        <div class="brand-logo-badge">V</div>
+        <div class="brand-text-col">
+          <div class="brand-title">
+            VISORIA TRACKER
+            <span class="brand-tag">ELECTRON</span>
+          </div>
+          <span class="brand-sub">On-Device Multimodal Attention Estimation Companion</span>
+        </div>
+      </div>
+
+      <div class="header-status-group">
+        <div id="statusPill" class="status-pill">
+          <span class="pulse-dot"></span>
+          <span id="statusText">Engine Standby</span>
+        </div>
+
+        <button id="btnOpenStudentApp" type="button" class="open-web-btn" title="Open Student Web Companion">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+          Student Web App
+        </button>
+      </div>
+    </header>
+
+    <!-- Socratic Intervention Dynamic Alert Banner -->
+    <div id="socraticBanner" class="socratic-alert-banner">
+      <div class="socratic-left">
+        <div class="socratic-icon-chip">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"></path>
+          </svg>
+        </div>
+        <div class="socratic-content-col">
+          <h4 id="socraticTitle">Socratic Reflection Active</h4>
+          <p id="socraticDesc">Your instructor has initiated a guided inquiry for your class session.</p>
+        </div>
+      </div>
+      <button id="btnJoinSocratic" type="button" class="btn-join-socratic">
+        Join Socratic Session ➔
+      </button>
+    </div>
+
+    <!-- Main 2-Column Stage -->
+    <main class="main-stage">
+      <!-- Left Column: Camera Stage -->
+      <section class="camera-container">
+        <div class="camera-header-row">
+          <span class="camera-header-title">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M23 7l-7 5 7 5V7z"></path>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+            </svg>
+            COMPUTER VISION HUD & WEBCAM FEED
+          </span>
+          <span id="fpsReadout" style="font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-tertiary);">0 FPS</span>
+        </div>
+
+        <div class="camera-view-box">
+          <img id="cameraFeed" class="camera-feed-img" style="display: none;" alt="Webcam HUD Stream">
+          
+          <div id="cameraPlaceholder" class="camera-placeholder">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M23 7l-7 5 7 5V7z"></path>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+            </svg>
+            <span>Tracking paused or stopped. Click "Start Tracking" below.</span>
+          </div>
+
+          <div id="hudOverlayTag" class="hud-overlay-tag" style="display: none;">
+            <span style="width: 6px; height: 6px; border-radius: 50%; background: var(--emerald);"></span>
+            <span>CV Ingestion Active</span>
+          </div>
+
+          <div id="hudAlertChip" class="hud-alert-chip">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <span id="hudAlertText">ALERT</span>
+          </div>
+        </div>
+
+        <!-- Camera Controls Dock -->
+        <div class="camera-dock">
+          <div class="dock-controls-left">
+            <button id="btnStartStop" type="button" class="btn-dock-action btn-primary-emerald">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+              </svg>
+              <span>Start Tracking</span>
+            </button>
+
+            <button id="btnPauseCamera" type="button" class="btn-dock-action btn-pause-amber" disabled>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="6" y="4" width="4" height="16"></rect>
+                <rect x="14" y="4" width="4" height="16"></rect>
+              </svg>
+              <span>Pause Camera</span>
+            </button>
+          </div>
+
+          <div class="dock-hud-switches">
+            <button type="button" class="hud-toggle-chip" data-hud="mesh">Mesh</button>
+            <button type="button" class="hud-toggle-chip active" data-hud="bbox">Box</button>
+            <button type="button" class="hud-toggle-chip active" data-hud="pose">Pose</button>
+            <button type="button" class="hud-toggle-chip active" data-hud="iris">Iris</button>
+            <button type="button" class="hud-toggle-chip active" data-hud="hands">Hands</button>
+            <button type="button" class="hud-toggle-chip active" data-hud="phone">Phone</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Telemetry & Config -->
+      <section class="telemetry-sidebar">
+        <!-- Attention Probability Gauge -->
+        <div class="stat-card">
+          <div class="stat-card-title">
+            <span>Behavioral Attention State</span>
+            <span id="attentionStateBadge" style="font-family: var(--font-mono); font-size: 0.72rem; color: var(--emerald);">FOCUSED</span>
+          </div>
+
+          <div class="attention-gauge-wrap">
+            <div class="gauge-header">
+              <span id="attentionLabel" class="gauge-label">Attentive</span>
+              <span id="attentionPct" class="gauge-pct">0%</span>
+            </div>
+
+            <div class="gauge-track">
+              <div id="gaugeFill" class="gauge-fill"></div>
+            </div>
+
+            <div class="gauge-footer">
+              <span>Smoothed: <strong id="probSmoothedVal" style="color: var(--text-primary); font-family: var(--font-mono);">0.00</strong></span>
+              <span>Raw ML: <strong id="probRawVal" style="color: var(--text-primary); font-family: var(--font-mono);">0.00</strong></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Biometrics & Posture Grid -->
+        <div class="stat-card">
+          <div class="stat-card-title">
+            <span>Real-Time Biometrics & Posture</span>
+          </div>
+
+          <div class="telemetry-grid">
+            <div class="telemetry-metric-tile">
+              <span class="metric-tile-label">Gaze Vector</span>
+              <span id="metricGaze" class="metric-tile-val">Center</span>
+            </div>
+
+            <div class="telemetry-metric-tile">
+              <span class="metric-tile-label">Blink Frequency</span>
+              <span id="metricBlinks" class="metric-tile-val">0 BPM (0)</span>
+            </div>
+
+            <div class="telemetry-metric-tile">
+              <span class="metric-tile-label">Head Pose Angles</span>
+              <span id="metricPose" class="metric-tile-val" style="font-size: 0.8rem;">P: 0° | Y: 0° | R: 0°</span>
+            </div>
+
+            <div class="telemetry-metric-tile">
+              <span class="metric-tile-label">Device Presence</span>
+              <span id="metricPhone" class="metric-tile-val">Clear</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Session Credentials & Setup -->
+        <div class="stat-card">
+          <div class="stat-card-title">
+            <span>Student & Session Settings</span>
+            <span id="saveStatusTag" style="font-size: 0.7rem; color: var(--text-tertiary);"></span>
+          </div>
+
+          <form id="configForm" class="config-group">
+            <div class="config-field">
+              <label class="config-label" for="inputName">Student Name</label>
+              <input id="inputName" type="text" class="config-input" placeholder="e.g. John Doe" required>
+            </div>
+
+            <div class="config-field">
+              <label class="config-label" for="inputRoll">Roll Number / ID</label>
+              <input id="inputRoll" type="text" class="config-input" placeholder="e.g. ROLL001" required>
+            </div>
+
+            <div class="config-field">
+              <label class="config-label" for="inputClass">Class Code</label>
+              <input id="inputClass" type="text" class="config-input" placeholder="e.g. CS101" required>
+            </div>
+
+            <div class="config-field">
+              <label class="config-label" for="inputJoinCode">Session Join Code</label>
+              <input id="inputJoinCode" type="text" class="config-input" placeholder="e.g. ABC123" required>
+            </div>
+
+            <div class="config-field" style="grid-column: span 2;">
+              <label class="config-label" for="inputServer">Visoria Server URL</label>
+              <input id="inputServer" type="url" class="config-input" placeholder="http://localhost:8000" required>
+            </div>
+          </form>
+
+          <div style="display: flex; justify-content: flex-end; margin-top: 0.75rem;">
+            <button id="btnSaveConfig" type="button" class="open-web-btn" style="padding: 0.4rem 0.85rem;">
+              Save Settings
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

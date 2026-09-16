@@ -59,8 +59,8 @@ export function wsUrl(path) {
   const token = getToken();
   const classCode = getActiveClass();
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = import.meta.env.DEV ? 'localhost:8000' : window.location.host;
-  const base = import.meta.env.DEV ? `${proto}//${host}` : `${proto}//${window.location.host}`;
+  const host = import.meta.env.DEV ? '127.0.0.1:8000' : window.location.host;
+  const base = `${proto}//${host}`;
   const params = new URLSearchParams();
   if (token) params.set('token', token);
   if (classCode) params.set('class_code', classCode);

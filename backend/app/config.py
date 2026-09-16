@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     session_ttl_days: int = Field(default=90, alias="SESSION_TTL_DAYS")
 
     attention_threshold: int = Field(default=50, alias="ATTENTION_THRESHOLD")
+    sustained_duration_sec: float = Field(default=30.0, alias="SUSTAINED_DURATION_SEC")
+    sustained_low_attention_sec: int = Field(default=30, alias="SUSTAINED_LOW_ATTENTION_SEC")
+    class_average_threshold: int = Field(default=60, alias="CLASS_AVERAGE_THRESHOLD")
+    alert_window_size_sec: float = Field(default=30.0, alias="ALERT_WINDOW_SIZE_SEC")
+    alert_cooldown_sec: float = Field(default=45.0, alias="ALERT_COOLDOWN_SEC")
     auth_rate_limit: int = Field(default=20, alias="AUTH_RATE_LIMIT")
     auth_rate_window_sec: int = Field(default=60, alias="AUTH_RATE_WINDOW_SEC")
     telemetry_rate_limit: int = Field(default=120, alias="TELEMETRY_RATE_LIMIT")

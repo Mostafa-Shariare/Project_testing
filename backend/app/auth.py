@@ -57,3 +57,27 @@ def verify_password(password: str, hashed: str) -> bool:
         return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
+
+
+def create_join_token(session_id: str, class_code: str, student_id: str, minutes: int = 5) -> str:
+    """Generate a short-lived single-purpose join token for Socratic sessions."""
+    payload = {
+        "sub": student_id,
+        "session_id": session_id,
+        "class_code": class_code,
+        "scope": "socratic_join",
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+
+
+def verify_join_token(token: str) -> dict | None:
+    """Verify and decode a Socratic join token."""
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[ALGORITHM])
+        if payload.get("scope") != "socratic_join":
+            return None
+        return payload
+    except jwt.PyJWTError:
+        return None
+

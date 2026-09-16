@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { apiFetch, setAuth } from '../api';
 
-export default function Login({ onSuccess, onSwitchRegister }) {
+export default function Login({ onSuccess, onSwitchRegister, onEnterStudent }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -63,6 +63,19 @@ export default function Login({ onSuccess, onSwitchRegister }) {
             Create account
           </button>
         </p>
+
+        {onEnterStudent && (
+          <div style={{ marginTop: '1.25rem', paddingTop: '1rem', borderTop: '1px solid #e2e8f0', textAlign: 'center' }}>
+            <button
+              type="button"
+              className="btn"
+              onClick={onEnterStudent}
+              style={{ width: '100%', fontSize: '0.85rem', background: '#f8fafc', color: '#0f172a', border: '1px solid #cbd5e1', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+            >
+              🎓 Enter Student Focus Portal
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
