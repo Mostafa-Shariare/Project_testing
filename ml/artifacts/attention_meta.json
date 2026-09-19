@@ -1,0 +1,36 @@
+{
+  "model_architecture": "LightGBM (Calibrated)",
+  "calibration_method": "isotonic",
+  "class_names": [
+    "Attentive",
+    "Distracted"
+  ],
+  "class_indices": {
+    "Attentive": 0,
+    "Distracted": 1
+  },
+  "positive_class": "Distracted",
+  "intervention_threshold_p_attentive": 0.6,
+  "feature_names": [
+    "no_of_face",
+    "face_x",
+    "face_y",
+    "face_w",
+    "face_con",
+    "no_of_hand",
+    "pose_x",
+    "pose_y",
+    "phone",
+    "phone_con",
+    "pose_down",
+    "pose_forward",
+    "pose_left",
+    "pose_right"
+  ],
+  "num_features": 14,
+  "test_accuracy": 0.995,
+  "test_macro_f1": 0.9948,
+  "test_roc_auc": 0.9985,
+  "test_brier": 0.0029,
+  "single_frame_latency_ms": 1.353
+}

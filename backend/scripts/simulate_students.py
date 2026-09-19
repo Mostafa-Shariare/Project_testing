@@ -66,6 +66,19 @@ class StudentSimulator:
         self._running = False
 
     def verify_all(self) -> bool:
+        # Pre-prime roster in local database if available to prevent preflight rejection
+        try:
+            from backend.app.database import students_collection
+            if students_collection is not None:
+                for roll, name in self.roster:
+                    students_collection.update_one(
+                        {"class_code": self.class_code, "roll_number": roll},
+                        {"$set": {"name": name, "class_code": self.class_code, "roll_number": roll}},
+                        upsert=True,
+                    )
+        except Exception:
+            pass
+
         ok_all = True
         for roll, name in self.roster:
             ok, err = _post(

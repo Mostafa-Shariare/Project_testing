@@ -11,6 +11,7 @@ from backend.app.database import (
     socratic_answers_collection,
     sessions_collection,
     intervention_activities_collection,
+    students_collection,
 )
 
 router = APIRouter(prefix="/api/socratic", tags=["socratic"])
@@ -354,6 +355,21 @@ async def get_socratic_session(session_id: str):
     }
 
 
+def _check_student_in_roster(class_code: str, roll_number: str):
+    if students_collection is not None:
+        roster = students_collection.find_one({
+            "class_code": class_code.strip().upper(),
+            "roll_number": roll_number.strip().upper()
+        })
+        if not roster:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Student '{roll_number}' is not on the class roster for {class_code}. Your teacher must add you before you can join.",
+            )
+        return roster
+    return None
+
+
 @router.post("/sessions/{session_id}/join")
 async def join_socratic_session(session_id: str, req: JoinSessionRequest):
     if socratic_sessions_collection is None:
@@ -373,6 +389,9 @@ async def join_socratic_session(session_id: str, req: JoinSessionRequest):
 
     roll = (req.roll_number or "STUDENT-01").strip().upper()
     code = session.get("class_code", req.class_code or "CS101").strip().upper()
+
+    # Verify student is in the class roster
+    _check_student_in_roster(code, roll)
 
     # Validate join token if passed
     if req.join_token:
@@ -995,6 +1014,92 @@ async def end_socratic_session(req: EndSessionRequest, username: str = Depends(g
     return {"session_id": req.session_id, "status": "ended"}
 
 
+def _format_activity_response_to_answer(act: dict, session_id_str: str, default_qid: Optional[str] = None, default_code: str = "CS101") -> dict:
+    rd = act.get("response_data", {})
+    act_type = act.get("activity_type", "")
+
+    selected_opt = None
+    selected_opts = None
+    answer_txt = None
+    confidence_val = "Recorded"
+    attempt_num = 1
+    selected_refl = None
+    refl_txt = None
+
+    if "selected_options" in rd:
+        opts = rd.get("selected_options")
+        if isinstance(opts, list):
+            selected_opts = opts
+            selected_opt = opts[0] if len(opts) == 1 else ", ".join(str(o) for o in opts)
+            answer_txt = ", ".join(str(o) for o in opts)
+        else:
+            selected_opt = str(opts)
+            answer_txt = str(opts)
+    elif "selected_option" in rd:
+        selected_opt = str(rd.get("selected_option"))
+        answer_txt = selected_opt
+
+    if "prediction" in rd:
+        pred = str(rd.get("prediction"))
+        answer_txt = pred
+        if "surprise_level" in rd:
+            confidence_val = f"Surprise: {rd.get('surprise_level')}/5"
+
+    if "identified_mistake" in rd or "mistake_explanation" in rd or "explanation" in rd:
+        mistake = str(rd.get("identified_mistake") or "").strip()
+        expl = str(rd.get("mistake_explanation") or rd.get("explanation") or "").strip()
+        if mistake and expl:
+            answer_txt = f"{mistake}: {expl}"
+        elif mistake:
+            answer_txt = mistake
+        elif expl:
+            answer_txt = expl
+
+    if "submitted_order" in rd:
+        order = rd.get("submitted_order", [])
+        if isinstance(order, list):
+            order_str = " -> ".join(str(s) for s in order)
+            answer_txt = order_str
+            selected_opt = order_str
+
+    if "explanation_text" in rd:
+        answer_txt = str(rd.get("explanation_text"))
+
+    if "answer" in rd:
+        answer_txt = str(rd.get("answer"))
+        if not selected_opt:
+            selected_opt = answer_txt
+
+    if "pre_confidence" in rd or "post_confidence" in rd:
+        pre = rd.get("pre_confidence")
+        post = rd.get("post_confidence")
+        if post:
+            confidence_val = f"Pre: {pre}/5 - Post: {post}/5" if pre else f"Confidence: {post}/5"
+            attempt_num = 2
+            selected_refl = selected_opt
+            refl_txt = answer_txt
+        elif pre:
+            confidence_val = f"Confidence: {pre}/5"
+
+    return {
+        "id": str(act["_id"]),
+        "session_id": session_id_str,
+        "question_id": default_qid or session_id_str,
+        "class_code": act.get("class_code", default_code),
+        "roll_number": act.get("roll_number", "STUDENT"),
+        "answer_text": answer_txt or "Submitted response",
+        "selected_option": selected_opt,
+        "selected_options": selected_opts,
+        "selected_reflection_option": selected_refl,
+        "reflection_text": refl_txt,
+        "attempt_number": attempt_num,
+        "confidence": confidence_val,
+        "activity_type": act_type,
+        "response_data": rd,
+        "created_at": act.get("submitted_at").isoformat() if act.get("submitted_at") else None
+    }
+
+
 @router.get("/session/active")
 async def get_active_session(class_code: str = Query(...), username: Optional[str] = Depends(get_optional_teacher)):
     code = class_code.strip().upper()
@@ -1023,11 +1128,13 @@ async def get_active_session(class_code: str = Query(...), username: Optional[st
         })
 
     answers = []
-    if username:
-        answers_docs = list(socratic_answers_collection.find({"question_id": {"$in": qids}}).sort("created_at", 1)) if qids else []
+    # 1. Fetch from socratic_answers_collection (traditional Think/Compare/Reflect/Reassess)
+    if qids and socratic_answers_collection is not None:
+        answers_docs = list(socratic_answers_collection.find({"question_id": {"$in": qids}}).sort("created_at", 1))
         for a in answers_docs:
             answers.append({
                 "id": str(a["_id"]),
+                "session_id": session_id_str,
                 "question_id": str(a.get("question_id")),
                 "class_code": a.get("class_code"),
                 "roll_number": a.get("roll_number"),
@@ -1036,8 +1143,21 @@ async def get_active_session(class_code: str = Query(...), username: Optional[st
                 "selected_reflection_option": a.get("selected_reflection_option"),
                 "reflection_text": a.get("reflection_text"),
                 "attempt_number": a.get("attempt_number", 1),
+                "confidence": a.get("confidence", "Confident"),
+                "activity_type": "socratic_question",
                 "created_at": a.get("created_at").isoformat() if a.get("created_at") else None
             })
+
+    # 2. Fetch from intervention_activities_collection (interactive activities: quick_poll, concept_check, etc.)
+    if intervention_activities_collection is not None:
+        activity_docs = list(intervention_activities_collection.find({"session_id": sid}).sort("submitted_at", 1))
+        for act in activity_docs:
+            answers.append(_format_activity_response_to_answer(
+                act=act,
+                session_id_str=session_id_str,
+                default_qid=str(qids[0]) if qids else session_id_str,
+                default_code=code
+            ))
 
     join_token = session.get("join_token") or create_join_token(session_id=session_id_str, class_code=code, student_id="STUDENT", minutes=60)
 
@@ -1319,8 +1439,25 @@ async def get_session_answers(session_id: str, username: str = Depends(get_curre
             "selected_option": a.get("selected_option"),
             "selected_reflection_option": a.get("selected_reflection_option"),
             "reflection_text": a.get("reflection_text"),
+            "confidence": a.get("confidence", "Confident"),
             "created_at": a.get("created_at").isoformat() if a.get("created_at") else None
         })
+
+    if intervention_activities_collection is not None:
+        session = socratic_sessions_collection.find_one({"_id": sid})
+        activity_docs = list(intervention_activities_collection.find({"session_id": sid}).sort("submitted_at", -1))
+        for act in activity_docs:
+            formatted = _format_activity_response_to_answer(
+                act=act,
+                session_id_str=str(sid),
+                default_qid=str(qids[0]) if qids else str(sid),
+                default_code=session.get("class_code", "CS101") if session else "CS101"
+            )
+            formatted["question_text"] = session.get("activity_config", {}).get("question_text") if session else "Activity Prompt"
+            formatted["question_type"] = session.get("activity_type", "activity") if session else "activity"
+            formatted["options"] = session.get("activity_config", {}).get("options", []) if session else []
+            results.append(formatted)
+
     return {"answers": results}
 
 
@@ -1412,6 +1549,49 @@ async def get_session_socratic_analytics(session_id: str, username: str = Depend
     reflections_count = 0
     improvements_count = 0
 
+    if not attempt1_docs and intervention_activities_collection is not None:
+        act_docs = list(intervention_activities_collection.find({"session_id": sid}))
+        for ad in act_docs:
+            roll = ad.get("roll_number", "STUDENT")
+            rd = ad.get("response_data", {})
+            t_dt = ad.get("submitted_at") or publish_dt
+            att_pre, att_post, obs_change = _calculate_pre_post_attention(class_code, roll, publish_dt, t_dt)
+            conf_shift = 0
+            if "pre_confidence" in rd and "post_confidence" in rd:
+                try:
+                    conf_shift = int(rd["post_confidence"]) - int(rd["pre_confidence"])
+                    confidence_shifts.append(conf_shift)
+                except Exception:
+                    pass
+            ans_val = (
+                rd.get("selected_option")
+                or rd.get("prediction")
+                or rd.get("identified_mistake")
+                or (" -> ".join(rd["submitted_order"]) if isinstance(rd.get("submitted_order"), list) else None)
+                or rd.get("explanation_text")
+                or "Submitted response"
+            )
+            attention_changes.append(obs_change)
+            durations.append(45.0)
+            if obs_change > 0 or conf_shift > 0:
+                improvements_count += 1
+            student_comparisons.append({
+                "roll_number": roll,
+                "attention_pre": att_pre,
+                "attention_post": att_post,
+                "observed_attention_change": obs_change,
+                "initial_answer": ans_val,
+                "revised_answer": None,
+                "answer_changed": False,
+                "initial_confidence": f"{rd.get('pre_confidence')}/5" if "pre_confidence" in rd else "Recorded",
+                "revised_confidence": f"{rd.get('post_confidence')}/5" if "post_confidence" in rd else None,
+                "confidence_shift": conf_shift,
+                "reflection_completed": bool(rd.get("explanation")),
+                "reflection_text": rd.get("explanation", ""),
+                "duration_sec": 45.0,
+                "learning_gain_indicator": "Activity Completed" if obs_change >= 0 else "Observed Attention Shift"
+            })
+
     for a1 in attempt1_docs:
         roll = a1.get("roll_number")
         a2 = att2_map.get(roll)
@@ -1479,8 +1659,8 @@ async def get_session_socratic_analytics(session_id: str, username: str = Depend
             "learning_gain_indicator": gain_indicator
         })
 
-    total_p = len(attempt1_docs)
-    total_c = len(attempt2_docs)
+    total_p = len(attempt1_docs) if attempt1_docs else len(student_comparisons)
+    total_c = len(attempt2_docs) if attempt1_docs else len(student_comparisons)
     comp_rate = round((total_c / total_p * 100), 1) if total_p > 0 else 0.0
     ans_change_rate = round((answer_changed_count / total_c * 100), 1) if total_c > 0 else 0.0
     refl_comp_rate = round((reflections_count / total_p * 100), 1) if total_p > 0 else 0.0

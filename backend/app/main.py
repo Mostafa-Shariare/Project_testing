@@ -425,10 +425,6 @@ async def lifespan(app: FastAPI):
     close_db()
 
 
-from backend.app.socratic_service import router as socratic_router
-
-app.include_router(socratic_router)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -684,6 +680,9 @@ async def delete_roster_student(
     result = students_collection.delete_one({"class_code": code, "roll_number": roll})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Student not on roster")
+    key = student_key(code, roll)
+    if key in students:
+        del students[key]
     return {"status": "deleted", "roll_number": roll}
 
 
@@ -946,11 +945,10 @@ async def get_live_student_detail(
 def _validate_join_code(class_doc: dict, join_code: str) -> None:
     submitted = (join_code or "").strip().upper()
     expected = (class_doc.get("join_code") or "").strip().upper()
-    if settings.require_join_code:
-        if not submitted:
-            raise HTTPException(status_code=403, detail="Join code is required for this class")
-        if expected and submitted != expected:
-            raise HTTPException(status_code=403, detail="Invalid class join code")
+    if settings.require_join_code and not submitted:
+        raise HTTPException(status_code=403, detail="Join code is required for this class")
+    if expected and submitted and submitted != expected:
+        raise HTTPException(status_code=403, detail="Invalid class join code")
 
 
 @app.get("/api/classes/{class_code}/public-info")
@@ -980,12 +978,20 @@ async def verify_student_join(body: StudentJoinVerify):
 
     roll = body.roll_number.strip().upper()
     name = body.name.strip()
-    if roll and name and students_collection is not None:
+    if not roll or not name:
+        raise HTTPException(status_code=400, detail="Roll number and student name are required")
+
+    if students_collection is not None:
         roster = students_collection.find_one({"class_code": class_code, "roll_number": roll})
-        if roster and roster.get("name", "").strip().lower() != name.lower():
+        if not roster:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Student '{roll}' is not on the class roster for {class_code}. Your teacher must add you before you can join.",
+            )
+        if roster.get("name", "").strip().lower() != name.lower():
             raise HTTPException(
                 status_code=400,
-                detail="Roll number is registered to a different student name for this class",
+                detail=f"Roll number '{roll}' is registered to '{roster.get('name')}' in this class.",
             )
 
     return {
@@ -1056,12 +1062,18 @@ async def update_student(update: StudentUpdate):
 
     _validate_join_code(class_doc, update.join_code)
 
+    roster = None
     if students_collection is not None:
         roster = students_collection.find_one({"class_code": class_code, "roll_number": roll_number})
-        if roster and roster.get("name", "").strip().lower() != name.lower():
+        if not roster:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Student '{roll_number}' is not on the class roster for {class_code}. Please ask your teacher to add you.",
+            )
+        if roster.get("name", "").strip().lower() != name.lower():
             raise HTTPException(
                 status_code=400,
-                detail="Roll number is registered to a different student name for this class",
+                detail=f"Roll number '{roll_number}' is registered to '{roster.get('name')}' in this class.",
             )
 
     if key in students:
@@ -1190,8 +1202,9 @@ async def update_student(update: StudentUpdate):
     dur_sec = round(now - ep["episode_start_time"], 1) if ep and ep.get("episode_start_time") else 0.0
     conf_pct = int(round((update.model_prob_smoothed or 0.85) * 100)) if (update.model_prob_smoothed or 0) > 0 else 85
 
+    canonical_name = (roster.get("name") if roster else None) or name
     students[key] = {
-        "name": name,
+        "name": canonical_name,
         "roll_number": roll_number,
         "class_code": class_code,
         "teacher_username": teacher_username,
@@ -1729,6 +1742,16 @@ async def websocket_student(websocket: WebSocket):
     await websocket.accept()
     class_code = websocket.query_params.get("class_code", "").strip().upper() or "CS101"
     student_id = websocket.query_params.get("student_id", "").strip().upper() or "STUDENT-01"
+
+    if students_collection is not None:
+        roster = students_collection.find_one({"class_code": class_code, "roll_number": student_id})
+        if not roster:
+            await websocket.send_json({
+                "event": "error",
+                "message": f"Student '{student_id}' is not on the class roster for {class_code}. Your teacher must add you first."
+            })
+            await websocket.close(code=1008)
+            return
 
     entry = {"ws": websocket, "class_code": class_code, "student_id": student_id}
     student_sockets.append(entry)

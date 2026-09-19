@@ -92,10 +92,22 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  
+  function getStudentAppBaseUrl(cfg) {
+    if (cfg.frontend_url && cfg.frontend_url.trim()) {
+      return cfg.frontend_url.trim().replace(/\/+$/, '');
+    }
+    if (cfg.server_url && cfg.server_url.trim() && !cfg.server_url.includes('localhost:8000') && !cfg.server_url.includes('127.0.0.1:8000')) {
+      return cfg.server_url.trim().replace(/\/+$/, '');
+    }
+    return 'http://localhost:5173';
+  }
+
   // Open Student Web App button
   btnOpenStudentApp.addEventListener('click', () => {
     const cfg = getCurrentConfig();
-    const targetUrl = `http://localhost:5173/?mode=student&class_code=${encodeURIComponent(cfg.class_code)}&roll=${encodeURIComponent(cfg.roll_number)}`;
+    const base = getStudentAppBaseUrl(cfg);
+    const targetUrl = `${base}/?mode=student&class_code=${encodeURIComponent(cfg.class_code)}&roll=${encodeURIComponent(cfg.roll_number)}`;
     window.electronAPI.openStudentApp(targetUrl);
   });
 
@@ -151,7 +163,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const sid = activeSocraticSession.session_id;
     const token = activeSocraticSession.join_token || '';
     const tokenParam = token ? `&join_token=${encodeURIComponent(token)}` : '';
-    const targetUrl = `http://localhost:5173/?mode=student&session_id=${encodeURIComponent(sid)}${tokenParam}&class_code=${encodeURIComponent(cfg.class_code)}&roll=${encodeURIComponent(cfg.roll_number)}`;
+    const base = getStudentAppBaseUrl(cfg);
+    const targetUrl = `${base}/?mode=student&session_id=${encodeURIComponent(sid)}${tokenParam}&class_code=${encodeURIComponent(cfg.class_code)}&roll=${encodeURIComponent(cfg.roll_number)}`;
     window.electronAPI.openStudentApp(targetUrl);
     socraticBanner.classList.remove('active');
   });

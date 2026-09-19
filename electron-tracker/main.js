@@ -171,7 +171,7 @@ ipcMain.on('update-hud', (_event, toggles) => {
 });
 
 ipcMain.on('open-student-app', (_event, targetUrl) => {
-  const finalUrl = targetUrl || 'http://localhost:5173/';
+  const finalUrl = targetUrl || (getInitialConfig().server_url || 'http://localhost:5173/');
   console.log('[Electron] Opening student app URL:', finalUrl);
   shell.openExternal(finalUrl);
 });

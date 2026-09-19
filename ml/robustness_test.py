@@ -76,8 +76,9 @@ def generate_scenario_sequence(scenario_name: str, num_frames: int = 100) -> lis
     derived from dataset baseline prototypes with controlled environmental variations.
     """
     df_dataset = pd.read_csv(DATASET_FILE)
-    attentive_prototypes = df_dataset[df_dataset["label"] == 1].to_dict(orient="records")
-    distracted_prototypes = df_dataset[df_dataset["label"] == 0].to_dict(orient="records")
+    # In attention_detection_dataset_v1.csv, label 0 = Attentive, label 1 = Distracted
+    attentive_prototypes = df_dataset[df_dataset["label"] == 0].to_dict(orient="records")
+    distracted_prototypes = df_dataset[df_dataset["label"] == 1].to_dict(orient="records")
 
     frames = []
 
@@ -200,28 +201,6 @@ def run_robustness_test_suite():
         frames = generate_scenario_sequence(sc_name, num_frames=100)
         smoother = TemporalSmoother(window=15, low=0.45, high=0.55)
 
-        # Batch predict raw model outputs for all frames in scenario
-        visible_frames = [f for f in frames if f["no_of_face"] > 0]
-        if visible_frames:
-            df_batch = pd.DataFrame(visible_frames).fillna(0)
-            if "pose" in df_batch.columns:
-                df_batch = pd.get_dummies(df_batch, columns=["pose"])
-            cols = joblib.load(COLUMNS_FILE)
-            df_aligned = pd.DataFrame(0, index=df_batch.index, columns=cols)
-            for c in cols:
-                if c in df_batch.columns:
-                    df_aligned[c] = df_batch[c].values
-            df_aligned = df_aligned.astype(float)
-            scaler = joblib.load(SCALER_FILE)
-            model = joblib.load(MODEL_FILE)
-            X_s = scaler.transform(df_aligned)
-            batch_probs = model.predict_proba(X_s)[:, 1]
-            batch_preds = model.predict(X_s)
-        else:
-            batch_probs = []
-            batch_preds = []
-
-        vis_idx = 0
         raw_preds = []
         raw_probs = []
         smoothed_preds = []
@@ -231,11 +210,10 @@ def run_robustness_test_suite():
         for idx, f_dict in enumerate(frames):
             exp_att = f_dict["expected_attentive"]
             if f_dict["no_of_face"] > 0:
-                raw_prob = float(batch_probs[vis_idx])
-                raw_pred = int(batch_preds[vis_idx])
-                vis_idx += 1
+                raw_prob = float(predict_proba_attention(f_dict))
+                raw_pred = int(predict_attention(f_dict))
             else:
-                raw_prob = 0.10
+                raw_prob = 0.0
                 raw_pred = 0
 
             sm_prob, sm_label = smoother.update(raw_prob)

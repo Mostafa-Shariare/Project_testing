@@ -102,7 +102,7 @@ export default function App() {
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  if (!authed && !urlSessionId) {
+  if (!authed && appMode !== 'student' && !urlSessionId) {
     return (
       <>
         {authError && <p className="global-auth-error">{authError}</p>}

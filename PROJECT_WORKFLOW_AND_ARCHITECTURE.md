@@ -106,8 +106,9 @@ Rather than treating attention as a direct screen-gaze metric, Attenova models a
                                             │ Feature Array
                                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ Stage 3: ML Attention Prediction (Instantaneous Random Forest)                        │
-│ • Evaluates `ml/model.py` Random Forest classifier → Instantaneous probability P_inst │
+│ Stage 3: ML Attention Prediction (Calibrated LightGBM v2)                              │
+│ • Evaluates `ml/model.py` LightGBM classifier → Out-of-fold calibrated P(Attentive)    │
+│ • Zero-DataFrame fast path (< 1.35ms latency, 59 KB artifact footprint)                │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
                                             │ Instantaneous P_inst
                                             ▼
@@ -122,16 +123,17 @@ Rather than treating attention as a direct screen-gaze metric, Attenova models a
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ Stage 5: Estimated Attention State & Intervention Decision                             │
 │ • State Categorization:                                                                │
-│   - >= 75%: "Optimal Focus"   (Deep cognitive flow state)                              │
-│   - 50–74%: "Mindful Focus"   (Acceptable learning engagement)                         │
-│   - 30–49%: "Attention Drift" (Mild distraction / shift)                               │
-│   - < 30%:  "Breather Suggested" (High distraction / prolonged fatigue)                 │
-### ML Model Evaluation & Benchmarking Workflow (`ml/eval_workflow.py`)
-- **Leakage-Safe Protocol**: 80/20 Stratified Train/Test split; `StandardScaler` and `SMOTE` (if applied) are fit **strictly on training partitions/folds**.
-- **5-Fold Stratified Cross-Validation**: `Accuracy: 99.13% ± 0.12%`, `Precision: 99.62% ± 0.00%`, `Recall: 98.30% ± 0.29%`, `F1-Score: 98.96% ± 0.15%`, `Macro-F1: 99.10% ± 0.13%`.
-- **Held-Out Test Set Performance**: `Accuracy: 99.88%`, `Precision: 100.00%`, `Recall: 99.70%`, `Macro-F1: 99.87%`.
-- **Temporal Smoothing Volatility Impact**: 15-frame `TemporalSmoother` rolling window reduces frame-to-frame decision flickering from **47.81% (raw frame instability) down to 2.38% (smooth state transition)**.
-- **Reproducible Artifact Exports**: Output saved to `ml/outputs/xai/ml_evaluation_metrics.json` and `ml/outputs/xai/ml_evaluation_report.md`.
+│   - >= 80%: "Optimal Focus"   (Deep cognitive flow state)                              │
+│   - 60–79%: "Mindful Focus"   (Acceptable learning engagement)                         │
+│   - 40–59%: "Attention Drift" (Mild distraction / shift)                               │
+│   - < 40%:  "Breather Suggested" (High distraction / prolonged fatigue)                 │
+### ML Model Evaluation & Benchmarking Workflow (`ml/eval_workflow.py` & v2 Colab Audit)
+- **Leakage-Safe Protocol**: Deduplicated dataset (3,970 unique samples); 80/20 Stratified Train/Test split; strictly fit on training partitions.
+- **Audited v2 Architecture**: LightGBM binary classifier (`n_estimators=300`, `learning_rate=0.03`, `max_depth=5`, `subsample=0.85`) with CalibratedClassifierCV (isotonic calibration).
+- **Corrected Label Semantics**: Inverted label bug in v1 resolved ($P(\text{Attentive}) = 1.0 - P(\text{Distracted})$).
+- **Held-Out Test Performance**: `Accuracy: 99.50%`, `Macro-F1: 0.9948`, `ROC-AUC: 0.9985`, `Brier Score: 0.0029`, `Latency: 1.35 ms`.
+- **Temporal Smoothing Volatility Impact**: 15-frame `TemporalSmoother` rolling window reduces frame-to-frame decision flickering from **47.81% (raw frame instability) down to < 2.5% (smooth state transition)**.
+- **Reproducible Artifact Exports**: Models saved to `ml/artifacts/attention_model.pkl` with metadata in `attention_meta.json`.
 
 ### System Robustness Testing Workflow & Debug Logger (`ml/robustness_test.py` & `client/tracker.py`)
 - **Variation Testing Matrix**: Evaluates system pipeline stability across 13 environmental and behavioral variations (low light, glare, desktop/laptop pitch tilt, eyeglasses occlusion, hand occlusion, temporary face dropouts, head oscillations, transient glances vs sustained drift).

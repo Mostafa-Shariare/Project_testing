@@ -58,14 +58,30 @@ export async function apiFetch(path, options = {}) {
 export function wsUrl(path) {
   const token = getToken();
   const classCode = getActiveClass();
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = import.meta.env.DEV ? '127.0.0.1:8000' : window.location.host;
-  const base = `${proto}//${host}`;
   const params = new URLSearchParams();
   if (token) params.set('token', token);
   if (classCode) params.set('class_code', classCode);
   const q = params.toString() ? `?${params.toString()}` : '';
-  return `${base}${path}${q}`;
+
+  // 1. Dedicated WebSocket URL override if configured
+  if (import.meta.env.VITE_WS_URL) {
+    const base = import.meta.env.VITE_WS_URL.replace(/\/+$/, '');
+    return `${base}${path}${q}`;
+  }
+
+  // 2. Derive WebSocket URL from VITE_API_URL if configured
+  if (import.meta.env.VITE_API_URL) {
+    try {
+      const u = new URL(import.meta.env.VITE_API_URL);
+      const wsProto = u.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${wsProto}//${u.host}${path}${q}`;
+    } catch (e) {}
+  }
+
+  // 3. Fallback: local dev vs production same-origin host
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const host = import.meta.env.DEV ? '127.0.0.1:8000' : window.location.host;
+  return `${proto}//${host}${path}${q}`;
 }
 
 export function exportHistoryUrl(classCode, fromDate, toDate) {

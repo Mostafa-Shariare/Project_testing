@@ -63,6 +63,19 @@ def test_student_telemetry(auth_headers):
         "attention": 80,
         "alert": "",
     }
+
+    # Should fail before teacher adds student to roster
+    unrostered = client.post("/api/student/update", json=payload)
+    assert unrostered.status_code == 403
+
+    # Teacher adds student to roster
+    roster_add = client.post(
+        f"/api/classes/{cls['class_code']}/roster",
+        json={"roll_number": "R001", "name": "Test Student"},
+        headers=auth_headers,
+    )
+    assert roster_add.status_code == 200
+
     r = client.post("/api/student/update", json=payload)
     assert r.status_code == 200
 
@@ -81,6 +94,25 @@ def test_student_verify_join_code(auth_headers):
         headers=auth_headers,
     ).json()
 
+    # Verify fails if not on roster
+    unrostered = client.post(
+        "/api/student/verify",
+        json={
+            "class_code": cls["class_code"],
+            "join_code": cls["join_code"],
+            "roll_number": "R002",
+            "name": "Verify Student",
+        },
+    )
+    assert unrostered.status_code == 403
+
+    # Teacher adds student to roster
+    client.post(
+        f"/api/classes/{cls['class_code']}/roster",
+        json={"roll_number": "R002", "name": "Verify Student"},
+        headers=auth_headers,
+    )
+
     ok = client.post(
         "/api/student/verify",
         json={
@@ -92,7 +124,7 @@ def test_student_verify_join_code(auth_headers):
     )
     assert ok.status_code == 200
 
-    bad = client.post(
+    bad_code = client.post(
         "/api/student/verify",
         json={
             "class_code": cls["class_code"],
@@ -101,4 +133,15 @@ def test_student_verify_join_code(auth_headers):
             "name": "Verify Student",
         },
     )
-    assert bad.status_code == 403
+    assert bad_code.status_code == 403
+
+    bad_name = client.post(
+        "/api/student/verify",
+        json={
+            "class_code": cls["class_code"],
+            "join_code": cls["join_code"],
+            "roll_number": "R002",
+            "name": "Wrong Name",
+        },
+    )
+    assert bad_name.status_code == 400

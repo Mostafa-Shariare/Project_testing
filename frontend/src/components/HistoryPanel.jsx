@@ -4,6 +4,8 @@ import {
   Calendar,
   CalendarRange,
   Download,
+  FileText,
+  Table,
   TrendingUp,
   TrendingDown,
   AlertTriangle,
@@ -33,6 +35,8 @@ import { Line } from 'react-chartjs-2';
 import { apiFetch, getToken, exportHistoryUrl } from '../api';
 import { buildQuery, dateRangeToUnix, defaultDateRange, formatDurationSec, formatTs } from '../utils/analyticsUtils';
 import SessionDetail from './SessionDetail';
+
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 ChartJS.register(
   CategoryScale,
@@ -113,7 +117,7 @@ export default function HistoryPanel({ classCode }) {
     };
   }, [classCode, range]);
 
-  const handleExport = () => {
+  const handleExportCsv = () => {
     const token = getToken();
     const q = buildQuery({
       class_code: classCode,
@@ -132,6 +136,55 @@ export default function HistoryPanel({ classCode }) {
         setTimeout(() => setStatusNotification(''), 3000);
       })
       .catch(() => setError('Export failed'));
+  };
+
+  const handleExportPdf = () => {
+    const token = getToken();
+    const q = buildQuery({
+      class_code: classCode,
+      ...dateRangeToUnix(range.from, range.to),
+    });
+    fetch(`${API_BASE}/api/analytics/reports/pdf?${q}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error('PDF export failed');
+        return res.blob();
+      })
+      .then((blob) => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `attention_summary_report_${classCode}.pdf`;
+        a.click();
+        setStatusNotification('Executive PDF report downloaded successfully');
+        setTimeout(() => setStatusNotification(''), 3000);
+      })
+      .catch((err) => setError(err.message || 'PDF export failed'));
+  };
+
+  const handleExportExcel = () => {
+    const token = getToken();
+    const q = buildQuery({
+      class_code: classCode,
+      format: 'xlsx',
+      ...dateRangeToUnix(range.from, range.to),
+    });
+    fetch(`${API_BASE}/api/analytics/attention/export?${q}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error('Excel export failed');
+        return res.blob();
+      })
+      .then((blob) => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `attention_session_analytics_${classCode}.xlsx`;
+        a.click();
+        setStatusNotification('Excel analytics workbook exported successfully');
+        setTimeout(() => setStatusNotification(''), 3000);
+      })
+      .catch((err) => setError(err.message || 'Excel export failed'));
   };
 
   // Student list mapping
@@ -375,16 +428,40 @@ export default function HistoryPanel({ classCode }) {
             <ChevronDown size={14} style={{ color: '#9ca3af' }} />
           </button>
 
-          {/* Export Report CTA */}
-          <button
-            type="button"
-            className="telemetry-analytics-export-btn"
-            onClick={handleExport}
-            title="Export full session CSV telemetry"
-          >
-            <Download size={14} />
-            <span>Export Report</span>
-          </button>
+          {/* Export Actions: PDF, Excel, CSV */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            <button
+              type="button"
+              className="telemetry-analytics-export-btn"
+              onClick={handleExportPdf}
+              title="Download executive PDF summary report"
+              style={{ background: 'rgba(239, 68, 68, 0.12)', borderColor: 'rgba(239, 68, 68, 0.3)', color: '#f87171' }}
+            >
+              <FileText size={14} />
+              <span>PDF Report</span>
+            </button>
+
+            <button
+              type="button"
+              className="telemetry-analytics-export-btn"
+              onClick={handleExportExcel}
+              title="Download detailed Excel analytics workbook"
+              style={{ background: 'rgba(16, 185, 129, 0.12)', borderColor: 'rgba(16, 185, 129, 0.3)', color: '#34d399' }}
+            >
+              <Table size={14} />
+              <span>Excel</span>
+            </button>
+
+            <button
+              type="button"
+              className="telemetry-analytics-export-btn"
+              onClick={handleExportCsv}
+              title="Export raw CSV telemetry stream"
+            >
+              <Download size={14} />
+              <span>CSV</span>
+            </button>
+          </div>
         </div>
       </div>
 

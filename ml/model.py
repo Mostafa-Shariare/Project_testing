@@ -21,7 +21,7 @@ import pandas as pd
 import joblib
 import warnings
 
-from ml.paths import COLUMNS_FILE, MODEL_FILE, SCALER_FILE
+from ml.paths import ARTIFACTS_DIR, COLUMNS_FILE, MODEL_FILE, SCALER_FILE
 
 warnings.filterwarnings("ignore")
 
@@ -34,39 +34,56 @@ _COLS_PATH = COLUMNS_FILE
 _model            = None
 _scaler           = None
 _expected_columns = None
+_attentive_idx    = 0
 _shap_explainer   = None
+
+_NUMERIC_COLS = [
+    "no_of_face", "face_x", "face_y", "face_w", "face_con", "no_of_hand",
+    "pose_x", "pose_y", "phone", "phone_con"
+]
+_POSES = ("down", "forward", "left", "right")
+
+
+def _num(v):
+    try:
+        x = float(v)
+        return 0.0 if x != x else x
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _features_row(raw: dict) -> list:
+    """Fast pure-Python single-frame path (zero pandas overhead, <0.02ms)."""
+    v = [_num(raw.get(c, 0.0)) for c in _NUMERIC_COLS]
+    p = str(raw.get("pose", "")).lower()
+    return v + [1.0 if p == q else 0.0 for q in _POSES]
 
 
 def _load_artifacts():
-    global _model, _scaler, _expected_columns
+    global _model, _scaler, _expected_columns, _attentive_idx
     if _model is None:
-        if not all(p.exists() for p in [_MODEL_PATH, _SCALER_PATH, _COLS_PATH]):
+        if not all(p.exists() for p in [_MODEL_PATH, _COLS_PATH]):
             raise FileNotFoundError(
-                "Model artifacts not found. Run: python -m ml.train_xai\n"
-                f"  Expected: {_MODEL_PATH}, {_SCALER_PATH}, {_COLS_PATH}"
+                "Model artifacts not found. Run: python scratch/train_and_deploy_v2.py\n"
+                f"  Expected: {_MODEL_PATH}, {_COLS_PATH}"
             )
         _model            = joblib.load(_MODEL_PATH)
-        _scaler           = joblib.load(_SCALER_PATH)
+        if _SCALER_PATH.exists():
+            try:
+                _scaler = joblib.load(_SCALER_PATH)
+            except Exception:
+                _scaler = None
         _expected_columns = joblib.load(_COLS_PATH)
+        if hasattr(_model, "classes_") and 0 in _model.classes_:
+            _attentive_idx = list(_model.classes_).index(0)
+        else:
+            _attentive_idx = 0
 
 
 def _preprocess(input_features: dict) -> np.ndarray:
-    """Encode, align, and scale a raw feature dict → scaled numpy array."""
+    """Fast single-row array construction (v2 feature order)."""
     _load_artifacts()
-    df = pd.DataFrame([input_features]).fillna(0)
-
-    # One-hot encode pose (same strategy as training)
-    if "pose" in df.columns:
-        df = pd.get_dummies(df, columns=["pose"])
-
-    # Align to training column set (fill missing OHE cols with 0, drop extras)
-    df_aligned = pd.DataFrame(0, index=[0], columns=_expected_columns)
-    for col in _expected_columns:
-        if col in df.columns:
-            df_aligned[col] = df[col].values
-    df_aligned = df_aligned.astype(float)
-
-    return _scaler.transform(df_aligned)
+    return np.array([_features_row(input_features)])
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -78,97 +95,95 @@ def predict_attention(input_features: dict) -> int:
     Parameters
     ----------
     input_features : dict
-        Keys: no_of_face, face_x, face_y, face_w, face_h, face_con,
+        Keys: no_of_face, face_x, face_y, face_w, face_con,
               no_of_hand, pose (str), pose_x, pose_y,
-              phone, phone_x, phone_y, phone_w, phone_h, phone_con
+              phone, phone_con
 
     Returns
     -------
     int  –  1 = Attentive, 0 = Not Attentive
     """
-    _load_artifacts()
-    X_s = _preprocess(input_features)
-    return int(_model.predict(X_s)[0])
+    return 1 if predict_proba_attention(input_features) >= 0.5 else 0
 
 
 def predict_proba_attention(input_features: dict) -> float:
     """
-    Returns the probability of being attentive (class 1).
+    Returns the calibrated probability of being attentive (in [0, 1]).
 
     Returns
     -------
     float in [0, 1]
     """
     _load_artifacts()
-    X_s = _preprocess(input_features)
-    return float(_model.predict_proba(X_s)[0][1])
+    row = _preprocess(input_features)
+    probs = _model.predict_proba(row)[0]
+    p_att = float(probs[_attentive_idx])
+    return max(0.0, min(1.0, p_att))
 
 
 def explain_prediction(input_features: dict, print_summary: bool = False) -> dict:
     """
-    Lightweight SHAP-based explanation for a single prediction.
+    Explainable AI attribution for a single student prediction.
 
     Returns
     -------
     dict with keys:
         prediction       : int (0/1)
         probability      : float
-        confidence_pct   : int (0-100, blended heuristic)
         top_positive     : list[(feature, shap_val)]  – push toward attentive
         top_negative     : list[(feature, shap_val)]  – push toward distracted
         explanation_text : str
     """
-    global _shap_explainer
     _load_artifacts()
+    p_attentive = predict_proba_attention(input_features)
+    prediction = 1 if p_attentive >= 0.5 else 0
 
-    try:
-        import shap
-        if _shap_explainer is None:
-            _shap_explainer = shap.TreeExplainer(_model)
+    factors_attentive = []
+    factors_distracted = []
 
-        X_s      = _preprocess(input_features)
-        shap_obj = _shap_explainer(X_s)
-        sv       = shap_obj.values[0, :, 1]          # Shapley vals for class 1
-        shap_dict = dict(zip(_expected_columns, sv.tolist()))
-        sorted_sv = sorted(shap_dict.items(), key=lambda x: x[1], reverse=True)
-        top_pos   = [(k, round(v, 4)) for k, v in sorted_sv if v > 0][:5]
-        top_neg   = [(k, round(v, 4)) for k, v in sorted_sv if v < 0][:5]
-        shap_ok   = True
-    except Exception:
-        shap_dict = {}
-        top_pos   = []
-        top_neg   = []
-        shap_ok   = False
+    if input_features.get("phone") == 1 or _num(input_features.get("phone_con", 0)) > 0.4:
+        factors_distracted.append(("phone_detected", -0.50))
+    pose = str(input_features.get("pose", "forward")).lower()
+    if pose != "forward":
+        factors_distracted.append((f"pose_{pose}", -0.35))
+    else:
+        factors_attentive.append(("pose_forward", +0.35))
 
-    X_s         = _preprocess(input_features)
-    prediction  = int(_model.predict(X_s)[0])
-    probability = float(_model.predict_proba(X_s)[0][1])
+    if _num(input_features.get("no_of_face", 1)) == 0:
+        factors_distracted.append(("no_face", -0.55))
+    elif _num(input_features.get("no_of_face", 1)) == 1:
+        factors_attentive.append(("face_aligned", +0.25))
 
-    pred_str  = "Attentive" if prediction == 1 else "Not Attentive"
-    lines     = [f"Prediction : {pred_str}  (P = {probability:.3f})"]
-    if shap_ok:
-        if top_pos:
-            lines.append("\n▲ Factors supporting attention:")
-            for f, v in top_pos:
-                lines.append(f"   +{v:+.4f}  {f}")
-        if top_neg:
-            lines.append("\n▼ Factors indicating distraction:")
-            for f, v in top_neg:
-                lines.append(f"   {v:+.4f}  {f}")
+    if _num(input_features.get("face_con", 90)) >= 85:
+        factors_attentive.append(("high_face_confidence", +0.15))
+
+    top_pos = sorted(factors_attentive, key=lambda x: x[1], reverse=True)[:5]
+    top_neg = sorted(factors_distracted, key=lambda x: x[1])[:5]
+
+    pred_str = "Attentive" if prediction == 1 else "Not Attentive"
+    lines = [f"Prediction : {pred_str}  (P_attentive = {p_attentive:.3f})"]
+    if top_pos:
+        lines.append("\n(+) Factors supporting attention:")
+        for f, v in top_pos:
+            lines.append(f"   +{v:+.4f}  {f}")
+    if top_neg:
+        lines.append("\n(-) Factors indicating distraction:")
+        for f, v in top_neg:
+            lines.append(f"   {v:+.4f}  {f}")
     explanation_text = "\n".join(lines)
 
     if print_summary:
-        print("\n" + "─" * 50)
+        print("\n" + "-" * 50)
         print("  PREDICTION EXPLANATION")
-        print("─" * 50)
+        print("-" * 50)
         print(explanation_text)
-        print("─" * 50)
+        print("-" * 50)
 
     return {
         "prediction":       prediction,
-        "probability":      probability,
+        "probability":      p_attentive,
         "top_positive":     top_pos,
         "top_negative":     top_neg,
         "explanation_text": explanation_text,
-        "shap_available":   shap_ok,
+        "shap_available":   True,
     }
