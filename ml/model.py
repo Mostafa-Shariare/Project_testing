@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import warnings
+import shap
 
 from ml.paths import ARTIFACTS_DIR, COLUMNS_FILE, MODEL_FILE, SCALER_FILE
 
@@ -38,8 +39,9 @@ _attentive_idx    = 0
 _shap_explainer   = None
 
 _NUMERIC_COLS = [
-    "no_of_face", "face_x", "face_y", "face_w", "face_con", "no_of_hand",
-    "pose_x", "pose_y", "phone", "phone_con"
+    "no_of_face", "face_x", "face_y", "face_w", "face_h", "face_con", "no_of_hand",
+    "pose_x", "pose_y", "phone", "phone_x", "phone_y", "phone_w", "phone_h", "phone_con",
+    "face_area", "phone_area", "face_phone_dist", "phone_near_face"
 ]
 _POSES = ("down", "forward", "left", "right")
 
@@ -54,8 +56,40 @@ def _num(v):
 
 def _features_row(raw: dict) -> list:
     """Fast pure-Python single-frame path (zero pandas overhead, <0.02ms)."""
-    v = [_num(raw.get(c, 0.0)) for c in _NUMERIC_COLS]
-    p = str(raw.get("pose", "")).lower()
+    # Create a working copy to inject engineered features
+    feats = dict(raw)
+    
+    # 1. face_area
+    face_w = _num(feats.get("face_w", 0.0))
+    face_h = _num(feats.get("face_h", 0.0))
+    feats["face_area"] = face_w * face_h
+    
+    # 2. phone_area
+    phone_w = _num(feats.get("phone_w", 0.0))
+    phone_h = _num(feats.get("phone_h", 0.0))
+    feats["phone_area"] = phone_w * phone_h
+    
+    # 3. face_phone_dist
+    phone = _num(feats.get("phone", 0.0))
+    if phone == 1.0:
+        face_x = _num(feats.get("face_x", 0.0))
+        face_y = _num(feats.get("face_y", 0.0))
+        phone_x = _num(feats.get("phone_x", 0.0))
+        phone_y = _num(feats.get("phone_y", 0.0))
+        import math
+        dist = math.sqrt((face_x - phone_x)**2 + (face_y - phone_y)**2)
+        feats["face_phone_dist"] = dist
+    else:
+        feats["face_phone_dist"] = 9999.0
+        
+    # 4. phone_near_face
+    if phone == 1.0 and feats["face_phone_dist"] < face_w * 2.0:
+        feats["phone_near_face"] = 1.0
+    else:
+        feats["phone_near_face"] = 0.0
+
+    v = [_num(feats.get(c, 0.0)) for c in _NUMERIC_COLS]
+    p = str(feats.get("pose", "")).lower()
     return v + [1.0 if p == q else 0.0 for q in _POSES]
 
 
@@ -78,12 +112,20 @@ def _load_artifacts():
             _attentive_idx = list(_model.classes_).index(0)
         else:
             _attentive_idx = 0
+            
+        global _shap_explainer
+        if _shap_explainer is None:
+            # Initialize SHAP TreeExplainer on the Random Forest model
+            _shap_explainer = shap.TreeExplainer(_model)
 
 
 def _preprocess(input_features: dict) -> np.ndarray:
     """Fast single-row array construction (v2 feature order)."""
     _load_artifacts()
-    return np.array([_features_row(input_features)])
+    raw_array = np.array([_features_row(input_features)])
+    if _scaler is not None:
+        return _scaler.transform(raw_array)
+    return raw_array
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -138,24 +180,36 @@ def explain_prediction(input_features: dict, print_summary: bool = False) -> dic
     p_attentive = predict_proba_attention(input_features)
     prediction = 1 if p_attentive >= 0.5 else 0
 
+    # Extract row features for SHAP
+    row = _preprocess(input_features)
+    
+    # Calculate SHAP values
+    # shap_values contains log odds contributions for each class
+    # For RandomForest, shap_values is a list of arrays (one per class)
+    shap_vals_raw = _shap_explainer.shap_values(row)
+    
+    # Since we want to explain the "Attentive" class, we get the values for _attentive_idx
+    # TreeExplainer usually returns a list for classification
+    if isinstance(shap_vals_raw, list):
+        shap_vals = shap_vals_raw[_attentive_idx][0]
+    else:
+        # In newer SHAP versions or binary classification, it might return a single array
+        if len(shap_vals_raw.shape) == 3:
+            shap_vals = shap_vals_raw[0, :, _attentive_idx]
+        else:
+            shap_vals = shap_vals_raw[0]
+
     factors_attentive = []
     factors_distracted = []
 
-    if input_features.get("phone") == 1 or _num(input_features.get("phone_con", 0)) > 0.4:
-        factors_distracted.append(("phone_detected", -0.50))
-    pose = str(input_features.get("pose", "forward")).lower()
-    if pose != "forward":
-        factors_distracted.append((f"pose_{pose}", -0.35))
-    else:
-        factors_attentive.append(("pose_forward", +0.35))
-
-    if _num(input_features.get("no_of_face", 1)) == 0:
-        factors_distracted.append(("no_face", -0.55))
-    elif _num(input_features.get("no_of_face", 1)) == 1:
-        factors_attentive.append(("face_aligned", +0.25))
-
-    if _num(input_features.get("face_con", 90)) >= 85:
-        factors_attentive.append(("high_face_confidence", +0.15))
+    # Map SHAP values to feature names
+    for i, col_name in enumerate(_expected_columns):
+        if i < len(shap_vals):
+            val = shap_vals[i]
+            if val > 0.01:
+                factors_attentive.append((col_name, val))
+            elif val < -0.01:
+                factors_distracted.append((col_name, val))
 
     top_pos = sorted(factors_attentive, key=lambda x: x[1], reverse=True)[:5]
     top_neg = sorted(factors_distracted, key=lambda x: x[1])[:5]
@@ -163,18 +217,18 @@ def explain_prediction(input_features: dict, print_summary: bool = False) -> dic
     pred_str = "Attentive" if prediction == 1 else "Not Attentive"
     lines = [f"Prediction : {pred_str}  (P_attentive = {p_attentive:.3f})"]
     if top_pos:
-        lines.append("\n(+) Factors supporting attention:")
+        lines.append("\n(+) Factors supporting attention (SHAP):")
         for f, v in top_pos:
             lines.append(f"   +{v:+.4f}  {f}")
     if top_neg:
-        lines.append("\n(-) Factors indicating distraction:")
+        lines.append("\n(-) Factors indicating distraction (SHAP):")
         for f, v in top_neg:
             lines.append(f"   {v:+.4f}  {f}")
     explanation_text = "\n".join(lines)
 
     if print_summary:
         print("\n" + "-" * 50)
-        print("  PREDICTION EXPLANATION")
+        print("  PREDICTION EXPLANATION (SHAP)")
         print("-" * 50)
         print(explanation_text)
         print("-" * 50)

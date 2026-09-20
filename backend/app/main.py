@@ -336,7 +336,7 @@ async def broadcast_to_teachers():
         active_list = active_by_class.get(code, [])
         class_avg_thr = _get_class_average_threshold(code)
         sustained_needed = _get_sustained_duration_sec(code)
-        ep = class_intervention_episodes.setdefault(code, {"start_time": None, "last_notified": None})
+        ep = class_intervention_episodes.setdefault(code, {"start_time": None, "last_notified": None, "soft_alert_fired": False})
 
         if active_list:
             inst_avg = sum(s.get("attention", 0) for s in active_list) / len(active_list)
@@ -354,6 +354,22 @@ async def broadcast_to_teachers():
                     ep["start_time"] = now
                 dur = now - ep["start_time"]
                 meta["sustained_low_attention"] = True
+                if dur >= 15.0 and not ep.get("soft_alert_fired"):
+                    ep["soft_alert_fired"] = True
+                    soft_notif_event = {
+                        "event": "pedagogical_intervention_soft_alert",
+                        "class_code": code,
+                        "class_avg": round(smoothed_avg),
+                        "sustained_sec": round(dur),
+                        "timestamp": now,
+                    }
+                    for entry in teacher_sockets:
+                        if entry.get("class_code") in (None, code):
+                            try:
+                                asyncio.create_task(entry["ws"].send_json(soft_notif_event))
+                            except Exception:
+                                pass
+
                 if dur >= sustained_needed:
                     meta["intervention_eligible"] = True
                     meta["intervention_reason"] = (
@@ -381,6 +397,7 @@ async def broadcast_to_teachers():
             else:
                 # Attention recovered above threshold: clear episode
                 ep["start_time"] = None
+                ep["soft_alert_fired"] = False
                 meta["intervention_eligible"] = False
                 meta["sustained_low_attention"] = False
                 meta["intervention_reason"] = ""
@@ -389,6 +406,7 @@ async def broadcast_to_teachers():
             meta["intervention_eligible"] = False
             meta["sustained_low_attention"] = False
             ep["start_time"] = None
+            ep["soft_alert_fired"] = False
 
     disconnected = []
     for entry in teacher_sockets:

@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
+import asyncio
 
 from backend.app.auth import verify_token, create_join_token, verify_join_token
 from backend.app.database import (
@@ -684,9 +685,21 @@ async def complete_socratic_session(session_id: str, req: CompleteStageRequest):
     if q_doc:
         qid = q_doc["_id"]
         roll = (req.roll_number or "STUDENT-01").strip().upper()
+        
+        # Calculate Delta C (Change in Confidence)
+        attempt1 = socratic_answers_collection.find_one({"question_id": qid, "roll_number": roll, "attempt_number": 1})
+        attempt2 = socratic_answers_collection.find_one({"question_id": qid, "roll_number": roll, "attempt_number": 2})
+        
+        delta_c = None
+        if attempt1 and attempt2:
+            conf_map = {"Very Confident": 3, "Confident": 2, "Unsure": 1}
+            c_before = conf_map.get(attempt1.get("confidence_level"), 2)
+            c_after = conf_map.get(attempt2.get("confidence_level"), 2)
+            delta_c = c_after - c_before
+
         socratic_answers_collection.update_many(
             {"question_id": qid, "roll_number": roll},
-            {"$set": {"completed": True, "completed_at": datetime.utcnow()}}
+            {"$set": {"completed": True, "completed_at": datetime.utcnow(), "delta_c": delta_c}}
         )
 
     return {"status": "ok", "state": "COMPLETED", "session_id": session_id}
@@ -702,15 +715,59 @@ async def end_session_endpoint(session_id: str, username: str = Depends(get_curr
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid session_id")
 
+    session_doc = socratic_sessions_collection.find_one({"_id": sid})
+    if not session_doc:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    end_time = datetime.utcnow()
+
     socratic_sessions_collection.update_one(
         {"_id": sid},
-        {"$set": {"status": "ended", "end_time": datetime.utcnow()}}
+        {"$set": {"status": "ended", "end_time": end_time}}
     )
 
     await broadcast_socratic_event("socratic_session_ended", {
         "session_id": session_id,
         "status": "ended"
     })
+
+    # Schedule Delta S (Change in Attention) calculation
+    async def _calculate_delta_s_async(sid: ObjectId, class_code: str, start_time: datetime, end_time: datetime):
+        await asyncio.sleep(120)
+        try:
+            pre_start = start_time - timedelta(seconds=120)
+            pre_end = start_time
+            post_start = end_time
+            post_end = end_time + timedelta(seconds=120)
+
+            def _get_avg_attention(t_start, t_end):
+                pipeline = [
+                    {"$match": {"class_code": class_code}},
+                    {"$unwind": "$logs"},
+                    {"$match": {"logs.timestamp": {"$gte": t_start, "$lte": t_end}}},
+                    {"$group": {"_id": None, "avg": {"$avg": "$logs.attention"}}}
+                ]
+                res = list(sessions_collection.aggregate(pipeline))
+                if res and res[0]["avg"] is not None:
+                    return res[0]["avg"]
+                return None
+
+            att_before = _get_avg_attention(pre_start, pre_end)
+            att_after = _get_avg_attention(post_start, post_end)
+            
+            if att_before is not None and att_after is not None:
+                delta_s = att_after - att_before
+                socratic_sessions_collection.update_one(
+                    {"_id": sid},
+                    {"$set": {"delta_s": delta_s, "attention_before": att_before, "attention_after": att_after}}
+                )
+        except Exception as e:
+            print(f"Error calculating Delta S for {sid}: {e}")
+
+    class_code = session_doc.get("class_code")
+    start_time = session_doc.get("start_time")
+    if class_code and start_time:
+        asyncio.create_task(_calculate_delta_s_async(sid, class_code, start_time, end_time))
 
     return {"session_id": session_id, "status": "ended"}
 

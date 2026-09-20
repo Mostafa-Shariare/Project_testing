@@ -16,7 +16,9 @@ New addition:
 Author: (your name)
 """
 
-import os, warnings
+import os, sys, warnings
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 import numpy as np
 import pandas as pd
 import matplotlib

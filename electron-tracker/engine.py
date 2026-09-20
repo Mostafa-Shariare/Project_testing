@@ -324,6 +324,11 @@ class HeadlessTrackerEngine:
         blink_det = BlinkDetector()
         smoother = TemporalSmoother(window=15, low=0.45, high=0.55)
         yolo_worker = YOLOWorker(every_n=6)
+        
+        self.baseline_pitch = 0.0
+        self.baseline_yaw = 0.0
+        self.calibrated = False
+
         emit({"type": "status", "message": "Vision pipeline active. Streaming feed..."})
 
         fps_timer = time.time()
@@ -400,6 +405,24 @@ class HeadlessTrackerEngine:
                     )
                     blink_det.update(ear_avg)
                     bpm = blink_det.blinks_per_minute()
+
+                    # Dynamic Pose Calibration
+                    if pose_angles and gaze_dir == "Center":
+                        alpha = 0.05 if self.calibrated else 1.0
+                        self.baseline_pitch = self.baseline_pitch * (1 - alpha) + pose_angles[0] * alpha
+                        self.baseline_yaw = self.baseline_yaw * (1 - alpha) + pose_angles[1] * alpha
+                        self.calibrated = True
+
+                    if pose_angles and self.calibrated:
+                        pose_angles = (
+                            pose_angles[0] - self.baseline_pitch,
+                            pose_angles[1] - self.baseline_yaw,
+                            pose_angles[2]
+                        )
+                        feat["pose_x"] = float(pose_angles[1])
+                        feat["pose_y"] = float(pose_angles[0])
+                        from client.tracker import pose_bucket
+                        feat["pose"] = pose_bucket(feat["pose_x"], feat["pose_y"])
 
                     # Heuristic attention
                     if face_absent:
